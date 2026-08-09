@@ -7335,7 +7335,12 @@ if Userdef then
         s:=ExtractFilePath(s);
       end;
     end else begin
-
+{$ifdef mswindows}
+      if not Userdef then begin
+        p:=Format(FFileManagerDefaultParam, [s]);
+        s:=FFileManagerDefault;
+      end;
+{$endif mswindows}
     end;
 
 {$ifdef mswindows}
