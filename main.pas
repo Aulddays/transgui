@@ -7237,9 +7237,10 @@ end;
 
 function TMainForm.SetCurrentFilePriority(const APriority: string): boolean;
 var
-  Files: array of integer;
-  i, j, k, level: integer;
+  Files, WantedFiles, UnwantedFiles: array of integer;
+  i, j, k, level, WantedCount, UnwantedCount: integer;
   pri: string;
+  PriorityResult: boolean;
 begin
   Result:= false;
   if (gTorrents.Items.Count = 0) or (PageInfo.ActivePage <> tabFiles) then exit;
@@ -7269,19 +7270,36 @@ begin
   end
   else begin
     // Priority based on checkbox state
+    SetLength(WantedFiles, FFiles.Count);
+    SetLength(UnwantedFiles, FFiles.Count);
+    WantedCount:=0;
+    UnwantedCount:=0;
     for i:=0 to FFiles.Count - 1 do
       if not FFilesTree.IsFolder(i) then begin
         k:=FFiles[idxFilePriority, i];
         if (k <> TR_PRI_SKIP) <> (FFilesTree.Checked[i] = cbChecked) then begin
-          if pri = '' then
-            if FFilesTree.Checked[i] = cbChecked then
-              pri:='normal'
-            else
-              pri:='skip';
-          Files[j]:=FFiles[idxFileId, i];
-          Inc(j);
+          if FFilesTree.Checked[i] = cbChecked then begin
+            WantedFiles[WantedCount]:=FFiles[idxFileId, i];
+            Inc(WantedCount);
+          end
+          else begin
+            UnwantedFiles[UnwantedCount]:=FFiles[idxFileId, i];
+            Inc(UnwantedCount);
+          end;
         end;
       end;
+    if (WantedCount = 0) and (UnwantedCount = 0) then exit;
+    Result:=True;
+    if WantedCount > 0 then begin
+      SetLength(WantedFiles, WantedCount);
+      Result:=SetFilePriority(RpcObj.CurTorrentId, WantedFiles, 'normal');
+    end;
+    if UnwantedCount > 0 then begin
+      SetLength(UnwantedFiles, UnwantedCount);
+      PriorityResult:=SetFilePriority(RpcObj.CurTorrentId, UnwantedFiles, 'skip');
+      Result:=Result and PriorityResult;
+    end;
+    exit;
   end;
 
   if j = 0 then exit;
