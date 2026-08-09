@@ -423,6 +423,13 @@ end;
 function TConnOptionsForm.Validate: boolean;
 begin
   Result:=False;
+  if cbAuth.Checked and not cbAskPassword.Checked and
+    ((Pos('{', edPassword.Text) > 0) or (Pos('}', edPassword.Text) > 0)) then begin
+    Page.ActivePage:=tabConnection;
+    edPassword.SetFocus;
+    MessageDlg('The password can''t contain the characters: { }', mtError, [mbOK], 0);
+    exit;
+  end;
   edHost.Text:=Trim(edHost.Text);
   if Trim(edHost.Text) = '' then begin
     Page.ActivePage:=tabConnection;
@@ -590,7 +597,7 @@ procedure TConnOptionsForm.SaveConnSettings(const ConnName: string);
 var
   Sec: string;
   i: integer;
-  s,ss: string;
+  s: string;
 begin
   if ConnName = '' then
     exit;
@@ -627,11 +634,6 @@ begin
       WriteString(Sec, 'Password', '-')
     else
       if edPassword.Text <> '******' then begin
-        ss := edPassword.Text;
-        if (Pos('{', ss) > 0) or (Pos('}', ss) > 0) then begin
-          MessageDlg('The password can''t contain the characters: { }', mtError, [mbOK], 0);
-        end;
-
         if edPassword.Text = '' then
           s:=''
         else
@@ -711,4 +713,3 @@ initialization
   {$I connoptions.lrs}
 
 end.
-
