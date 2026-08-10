@@ -82,6 +82,7 @@ type
     FHintCell: TPoint;
     FCurSearch: string;
     FSearchTimer: TTimer;
+    FWheelDeltaRemainder: integer;
     FOldOpt: TGridOptions;
     FNoDblClick: boolean;
     FStrEditor: TVarGridStringEditor;
@@ -1139,22 +1140,45 @@ begin
 end;
 
 function TVarGrid.DoMouseWheel(Shift: TShiftState; WheelDelta: Integer; MousePos: TPoint): Boolean;
+var
+  ScrollDelta: integer;
 begin
   Result:=inherited DoMouseWheel(Shift, WheelDelta, MousePos);
   if not Result then begin
-    if Mouse.WheelScrollLines = -1 then
   {$IF LCL_FULLVERSION < 1080000}
+    if Mouse.WheelScrollLines = -1 then
       GridMouseWheel(Shift, -WheelDelta*VisibleRowCount div 120)
     else
       GridMouseWheel(Shift, -WheelDelta*Mouse.WheelScrollLines div 120);
   {$ENDIF}
   {$IF LCL_FULLVERSION >= 1080000}
-      GridMouseWheel(Shift, WheelDelta*VisibleRowCount div 120)
-    else
-      GridMouseWheel(Shift, -WheelDelta div 120);
+    if (Mouse.WheelScrollLines > 0) and (MouseWheelOption <> mwCursor)
+    and not (ssCtrl in Shift) then begin
+      // Preserve precision touchpad input until it represents a whole row.
+      // A full WheelDelta of 120 still maps to Mouse.WheelScrollLines rows.
+      Inc(FWheelDeltaRemainder, WheelDelta*Mouse.WheelScrollLines);
+      ScrollDelta:=FWheelDeltaRemainder div 120;
+      FWheelDeltaRemainder:=FWheelDeltaRemainder mod 120;
+      if ScrollDelta <> 0 then
+        TopRow:=TopRow-ScrollDelta;
+    end
+    else begin
+      // Keep the LCL handling for page scrolling, horizontal scrolling, and
+      // cursor navigation modes.
+      Inc(FWheelDeltaRemainder, WheelDelta);
+      ScrollDelta:=FWheelDeltaRemainder div 120;
+      FWheelDeltaRemainder:=FWheelDeltaRemainder mod 120;
+      if ScrollDelta <> 0 then
+        if Mouse.WheelScrollLines = -1 then
+          GridMouseWheel(Shift, ScrollDelta*VisibleRowCount)
+        else
+          GridMouseWheel(Shift, -ScrollDelta);
+    end;
   {$ENDIF}
-      Result := True;
-  end;
+    Result := True;
+  end
+  else
+    FWheelDeltaRemainder:=0;
 end;
 
 constructor TVarGrid.Create(AOwner: TComponent);
