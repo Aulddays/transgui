@@ -157,6 +157,7 @@ type
     Lst: TDate;
   end;
 
+  TPostAddFilterKind = (pafNone, pafPath, pafTracker);
 
   { TProgressImage }
 
@@ -667,6 +668,8 @@ type
     FCurUpSpeedLimit: integer;
     FFlagsPath: string;
     FAddingTorrent: integer;
+    FPostAddTorrentId: integer;
+    FPostAddFilterKind: TPostAddFilterKind;
     FPendingTorrents: TStringList;
     FLinksFromClipboard: boolean;
     FLastClipboardLink: string;
@@ -2292,6 +2295,7 @@ var
   torrent: string;
   WaitForm: TBaseForm;
   IsAppHidden: boolean;
+  PostAddFilterKind: TPostAddFilterKind;
 
   Procedure _AddTrackers(TorrentId: integer);
   var
@@ -2558,6 +2562,9 @@ var
   pFD:FolderData;
 begin
   Result:=False;
+  PostAddFilterKind:=pafNone;
+  FPostAddTorrentId:=0;
+  FPostAddFilterKind:=pafNone;
   if not RpcObj.Connected and not RpcObj.Connecting then
     if not DoConnect then
       exit;
@@ -2638,6 +2645,16 @@ begin
           req.Free;
         end;
 
+        if lvFilter.Row >= StatusFiltersCount then begin
+          i:=lvFilter.Row;
+          if VarIsNull(lvFilter.Items[0, i]) then
+            Dec(i);
+          if i >= StatusFiltersCount then
+            if not VarIsNull(lvFilter.Items[-1, i]) then
+              PostAddFilterKind:=pafPath
+            else
+              PostAddFilterKind:=pafTracker;
+        end;
         lvFilter.Row:=0;
         edSearch.Text:='';
 
@@ -2803,6 +2820,11 @@ begin
           if cbStartTorrent.Checked then
             TorrentAction(id, 'torrent-start');
 
+          if PostAddFilterKind <> pafNone then begin
+            FPostAddTorrentId:=id;
+            FPostAddFilterKind:=PostAddFilterKind;
+            DoRefresh(True);
+          end;
           SelectTorrent(id, 2000);
 
           id:=0;
@@ -5109,6 +5131,8 @@ begin
   end;
 
   RpcObj.Disconnect;
+  FPostAddTorrentId:=0;
+  FPostAddFilterKind:=pafNone;
 
   RpcObj.InfoStatus:=sDisconnected;
   CheckStatus;
@@ -5948,6 +5972,26 @@ begin
       FTorrents.Delete(i)
     else
       Inc(i);
+
+  if FPostAddTorrentId <> 0 then
+    if FTorrents.Find(idxTorrentId, FPostAddTorrentId, row) then begin
+      case FPostAddFilterKind of
+        pafPath:
+          if acFolderGrouping.Checked and not VarIsEmpty(FTorrents[idxPath, row])
+          and not VarIsNull(FTorrents[idxPath, row]) then begin
+            PathFilter:=UTF8Encode(widestring(FTorrents[idxPath, row]));
+            FilterIdx:=fltAll;
+          end;
+        pafTracker:
+          if acTrackerGrouping.Checked and not VarIsEmpty(FTorrents[idxTracker, row])
+          and not VarIsNull(FTorrents[idxTracker, row]) then begin
+            TrackerFilter:=UTF8Encode(widestring(FTorrents[idxTracker, row]));
+            FilterIdx:=fltAll;
+          end;
+      end;
+      FPostAddTorrentId:=0;
+      FPostAddFilterKind:=pafNone;
+    end;
 
   gTorrents.Items.BeginUpdate;
   try
