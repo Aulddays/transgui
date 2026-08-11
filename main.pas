@@ -29,7 +29,7 @@ uses
   {$else}
   lclintf,
   {$endif windows}
-  Graphics, Dialogs, ComCtrls, Menus, ActnList, LCLVersion,
+  Graphics, Dialogs, ComCtrls, Menus, ActnList, LCLVersion, IntfGraphics,
   httpsend, StdCtrls, fpjson, jsonparser, ExtCtrls, rpc, syncobjs, variants, varlist, IpResolver,
   zipper, ResTranslator, VarGrid, StrUtils, LCLProc, Grids, BaseForm, utils, AddTorrent, Types,
   LazFileUtils, LazUTF8, StringToVK, passwcon, GContnrs,lineinfo;
@@ -668,6 +668,8 @@ type
     FCurUpSpeedLimit: integer;
     FFlagsPath: string;
     FAddingTorrent: integer;
+    FScaledToolbarImages: TImageList;
+    FScaledToolbarImageSize: integer;
     FPostAddTorrentId: integer;
     FPostAddFilterKind: TPostAddFilterKind;
     FPendingTorrents: TStringList;
@@ -703,6 +705,10 @@ type
 
     procedure UpdateUI;
     procedure UpdateUIRpcVersion(RpcVersion: integer);
+    function GetMainToolbarIconSize: integer;
+    procedure ClearScaledToolbarImages;
+    function CreateScaledToolbarImages(AImageSize: integer): TImageList;
+    procedure UpdateMainToolbarImages;
     function DoConnect: boolean;
     procedure DoCreateOutZipStream(Sender: TObject; var AStream: TStream; AItem: TFullZipFileEntry);
     procedure DoDisconnect;
@@ -1477,6 +1483,109 @@ end;
 
 { TMainForm }
 
+function TMainForm.GetMainToolbarIconSize: integer;
+begin
+  Result:=(MainToolBar.ButtonHeight*16 + 11) div 23;
+  if Result < 16 then
+    Result:=16
+  else
+    if Result > 32 then
+      Result:=32;
+end;
+
+procedure TMainForm.ClearScaledToolbarImages;
+begin
+  if FScaledToolbarImages <> nil then begin
+    if MainToolBar.Images = FScaledToolbarImages then
+      MainToolBar.Images:=ImageList16;
+    FreeAndNil(FScaledToolbarImages);
+  end;
+  FScaledToolbarImageSize:=0;
+end;
+
+function TMainForm.CreateScaledToolbarImages(AImageSize: integer): TImageList;
+var
+  i, x, y: integer;
+  Source, Target: TBitmap;
+  SourceImage, TargetImage: TLazIntfImage;
+begin
+  Result:=nil;
+  if ImageList16.Count <> ImageList32.Count then
+    exit;
+
+  Result:=TImageList.Create(Self);
+  try
+    Result.Width:=AImageSize;
+    Result.Height:=AImageSize;
+    Result.Masked:=False;
+    Result.BeginUpdate;
+    try
+      for i:=0 to ImageList32.Count - 1 do begin
+        Source:=TBitmap.Create;
+        try
+          ImageList32.GetBitmap(i, Source);
+          SourceImage:=Source.CreateIntfImage;
+          try
+            TargetImage:=TLazIntfImage.CreateCompatible(SourceImage, AImageSize, AImageSize);
+            try
+              for y:=0 to AImageSize - 1 do
+                for x:=0 to AImageSize - 1 do
+                  TargetImage.Colors[x, y]:=SourceImage.Colors[
+                    x*SourceImage.Width div AImageSize,
+                    y*SourceImage.Height div AImageSize];
+              Target:=TBitmap.Create;
+              try
+                Target.LoadFromIntfImage(TargetImage);
+                Result.Add(Target, nil);
+              finally
+                Target.Free;
+              end;
+            finally
+              TargetImage.Free;
+            end;
+          finally
+            SourceImage.Free;
+          end;
+        finally
+          Source.Free;
+        end;
+      end;
+    finally
+      Result.EndUpdate;
+    end;
+  except
+    FreeAndNil(Result);
+  end;
+end;
+
+procedure TMainForm.UpdateMainToolbarImages;
+var
+  ImageSize: integer;
+begin
+  ImageSize:=GetMainToolbarIconSize;
+  if ImageSize = 16 then begin
+    ClearScaledToolbarImages;
+    MainToolBar.Images:=ImageList16;
+  end
+  else
+  if ImageSize = 32 then begin
+    ClearScaledToolbarImages;
+    MainToolBar.Images:=ImageList32;
+  end
+  else begin
+    if (FScaledToolbarImages = nil) or (FScaledToolbarImageSize <> ImageSize) then begin
+      ClearScaledToolbarImages;
+      FScaledToolbarImages:=CreateScaledToolbarImages(ImageSize);
+      if FScaledToolbarImages <> nil then
+        FScaledToolbarImageSize:=ImageSize;
+    end;
+    if FScaledToolbarImages <> nil then
+      MainToolBar.Images:=FScaledToolbarImages
+    else
+      MainToolBar.Images:=ImageList16;
+  end;
+end;
+
 procedure TMainForm.FormCreate(Sender: TObject);
 var
   ws: TWindowState;
@@ -1492,6 +1601,14 @@ var
   pic: TPicture;
 {$endif darwin}
 begin
+  for i:=0 to MainToolBar.ControlCount - 1 do
+    if MainToolBar.Controls[i] is TToolButton then
+      with TToolButton(MainToolBar.Controls[i]) do
+        if Style in [tbsButton, tbsCheck, tbsDropDown] then
+          AutoSize:=False;
+  MainToolBar.ButtonWidth:=ScaleInt(23);
+  MainToolBar.ButtonHeight:=ScaleInt(23);
+  UpdateMainToolbarImages;
 {$ifdef darwin}
   // Load better icon if possible
   s:=ExtractFilePath(ParamStrUTF8(0)) + '..' + DirectorySeparator + 'Resources'
@@ -1836,6 +1953,7 @@ begin
     MakeTranslationFile;
   end;
 
+  ClearScaledToolbarImages;
   DeleteFileUTF8(FRunFileName);
   FPasswords.Free;
   FResolver.Free;
@@ -2257,12 +2375,11 @@ begin
   if acBigToolbar.Checked then begin
     MainToolBar.ButtonWidth:= Ini.ReadInteger('MainForm','BigToolBarHeight',64);
     MainToolBar.ButtonHeight:= MainToolBar.ButtonWidth;
-    MainToolBar.Images:= ImageList32;
   end else begin
-    MainToolBar.ButtonWidth:= 23;
-    MainToolBar.ButtonHeight:=23;
-    MainToolBar.Images:= ImageList16;
-    end;
+    MainToolBar.ButtonWidth:=ScaleInt(23);
+    MainToolBar.ButtonHeight:=ScaleInt(23);
+  end;
+  UpdateMainToolbarImages;
   Ini.WriteBool('MainForm', 'BigToolbar', acBigToolbar.Checked);
 end;
 
