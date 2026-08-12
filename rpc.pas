@@ -37,6 +37,34 @@ type
   TRefreshTypes = (rtTorrents, rtDetails, rtSession);
   TRefreshType = set of TRefreshTypes;
 
+  TRpcRequestLifetime = class
+  private
+    FRefCount: integer;
+  public
+    Active: boolean;
+    constructor Create;
+    procedure AddRef;
+    procedure Release;
+  end;
+
+  TRpcUserRequestCallback = procedure(ARequest: TObject) of object;
+
+  TRpcUserRequest = class
+  public
+    Request: TJSONObject;
+    ReturnArguments: boolean;
+    TimeOut: integer;
+    Result: TJSONObject;
+    Cancelled: boolean;
+    Context: TObject;
+    Callback: TRpcUserRequestCallback;
+    Lifetime: TRpcRequestLifetime;
+    constructor Create(ARequest: TJSONObject; AReturnArguments: boolean;
+      ATimeOut: integer; ACallback: TRpcUserRequestCallback;
+      ALifetime: TRpcRequestLifetime);
+    destructor Destroy; override;
+  end;
+
   TRpc = class;
 
   { TRpcThread }
@@ -84,6 +112,11 @@ type
   TRpc = class
   private
     FLock: TCriticalSection;
+    FQueueLock: TCriticalSection;
+    FQueueEvent: TEvent;
+    FPendingRefresh: TRefreshType;
+    FUserRequests: TList;
+    FStopping: boolean;
     FStatus: string;
     FInfoStatus: string;
     FConnected: boolean;
@@ -102,6 +135,15 @@ type
     procedure SetStatus(const AValue: string);
     procedure SetTorrentFields(const AValue: string);
     procedure CreateHttp;
+    function TakeRefresh(var ARefresh: TRefreshType): boolean;
+  public
+    function HasRefresh(ARefresh: TRefreshType): boolean;
+    procedure QueueRefresh(ARefresh: TRefreshType);
+    function TakeUserRequest: TRpcUserRequest;
+    function QueueUserRequest(ARequest: TRpcUserRequest): boolean;
+    procedure DispatchUserRequest(Data: PtrInt);
+    procedure CancelPendingUserRequests;
+    procedure WakeRpcThread;
   public
     Http: THTTPSend;
     HttpLock: TCriticalSection;
@@ -150,8 +192,10 @@ uses Main, ssl_openssl_lib, synafpc, blcksock;
 procedure TRpcThread.Execute;
 var
   t, tt: TDateTime;
-  i: integer;
+  i, WaitTime: integer;
   ai: TAdvInfoType;
+  Refresh: TRefreshType;
+  UserRequest: TRpcUserRequest;
 begin
   try
     GetSessionInfo;
@@ -159,26 +203,37 @@ begin
     if not FRpc.FConnected then
       Terminate;
 
-    t:=Now - 1;
+    t:=Now - 1;  // 立即触发第一次刷新
     tt:=Now;
     while not Terminated do begin
       if Now - t >= RefreshInterval then begin
-        FRpc.RefreshNow:=FRpc.RefreshNow + [rtTorrents, rtDetails];
+        FRpc.QueueRefresh([rtTorrents, rtDetails]);
         t:=Now;
       end;
       if Now - tt >= RefreshInterval*5 then begin
-        Include(FRpc.RefreshNow, rtSession);
+        FRpc.QueueRefresh([rtSession]);
         tt:=Now;
       end;
 
+      UserRequest:=FRpc.TakeUserRequest;
+      if UserRequest <> nil then begin
+        UserRequest.Result:=FRpc.SendRequest(UserRequest.Request,
+          UserRequest.ReturnArguments, UserRequest.TimeOut);
+        if Assigned(UserRequest.Callback) then
+          Application.QueueAsyncCall(@FRpc.DispatchUserRequest,
+            PtrInt(UserRequest))
+        else
+          UserRequest.Free;
+      end
+      else
       if Status = '' then
-        if rtTorrents in FRpc.RefreshNow then begin
+        if FRpc.TakeRefresh(Refresh) then begin
+          if rtTorrents in Refresh then begin
           GetTorrents;
-          Exclude(FRpc.RefreshNow, rtTorrents);
           t:=Now;
         end
         else
-          if rtDetails in FRpc.RefreshNow then begin
+          if rtDetails in Refresh then begin
             i:=CurTorrentId;
             ai:=AdvInfo;
             if i <> 0 then begin
@@ -198,23 +253,23 @@ begin
               aiStats:
                 GetStats;
             end;
-
-            if (i = CurTorrentId) and (ai = AdvInfo) then
-              Exclude(FRpc.RefreshNow, rtDetails);
           end
           else
-            if rtSession in FRpc.RefreshNow then begin
+            if rtSession in Refresh then
               GetSessionInfo;
-              Exclude(FRpc.RefreshNow, rtSession);
-            end;
+        end;
 
       if Status <> '' then begin
         NotifyCheckStatus;
         Sleep(100);
       end;
 
-      if FRpc.RefreshNow = [] then
-        Sleep(50);
+      WaitTime:=Round((RefreshInterval - (Now - t))*MSecsPerDay);
+      if WaitTime < 1 then
+        WaitTime:=1;
+      if WaitTime > 1000 then
+        WaitTime:=1000;
+      FRpc.FQueueEvent.WaitFor(WaitTime);
     end;
   except
     Status:=Exception(ExceptObject).Message;
@@ -230,6 +285,143 @@ end;
 constructor TRpcThread.Create;
 begin
   inherited Create(True);
+end;
+
+function TRpc.TakeRefresh(var ARefresh: TRefreshType): boolean;
+begin
+  FQueueLock.Enter;
+  try
+    ARefresh:=[];
+    if rtTorrents in FPendingRefresh then begin
+      ARefresh:=[rtTorrents];
+      Exclude(FPendingRefresh, rtTorrents);
+    end
+    else
+      if rtDetails in FPendingRefresh then begin
+        ARefresh:=[rtDetails];
+        Exclude(FPendingRefresh, rtDetails);
+      end
+      else
+        if rtSession in FPendingRefresh then begin
+          ARefresh:=[rtSession];
+          Exclude(FPendingRefresh, rtSession);
+        end;
+    Result:=ARefresh <> [];
+    if not Result then
+      FQueueEvent.ResetEvent;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+function TRpc.TakeUserRequest: TRpcUserRequest;
+begin
+  FQueueLock.Enter;
+  try
+    if FUserRequests.Count = 0 then
+      Result:=nil
+    else begin
+      Result:=TRpcUserRequest(FUserRequests[0]);
+      FUserRequests.Delete(0);
+    end;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+function TRpc.QueueUserRequest(ARequest: TRpcUserRequest): boolean;
+begin
+  Result:=False;
+  if ARequest = nil then
+    exit;
+  FQueueLock.Enter;
+  try
+    if FStopping then
+      ARequest.Free
+    else begin
+      FUserRequests.Add(ARequest);
+      FQueueEvent.SetEvent;
+      Result:=True;
+    end;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+procedure TRpc.CancelPendingUserRequests;
+var
+  Request: TRpcUserRequest;
+begin
+  FQueueLock.Enter;
+  try
+    while FUserRequests.Count > 0 do begin
+      Request:=TRpcUserRequest(FUserRequests[0]);
+      FUserRequests.Delete(0);
+      Request.Cancelled:=True;
+      Application.QueueAsyncCall(@DispatchUserRequest, PtrInt(Request));
+    end;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+procedure TRpc.DispatchUserRequest(Data: PtrInt);
+var
+  Request: TRpcUserRequest;
+  Callback: TRpcUserRequestCallback;
+begin
+  Request:=TRpcUserRequest(Data);
+  FQueueLock.Enter;
+  try
+    if (Request.Lifetime <> nil) and not Request.Lifetime.Active then
+      Callback:=nil
+    else
+      Callback:=Request.Callback;
+    Request.Callback:=nil;
+  finally
+    FQueueLock.Leave;
+  end;
+  try
+    if Assigned(Callback) then
+      Callback(Request);
+  finally
+    Request.Free;
+  end;
+end;
+
+function TRpc.HasRefresh(ARefresh: TRefreshType): boolean;
+begin
+  FQueueLock.Enter;
+  try
+    Result:=(FPendingRefresh * ARefresh) <> [];
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+procedure TRpc.QueueRefresh(ARefresh: TRefreshType);
+begin
+  if ARefresh = [] then
+    exit;
+  FQueueLock.Enter;
+  try
+    if not FStopping then begin
+      FPendingRefresh:=FPendingRefresh + ARefresh;
+      FQueueEvent.SetEvent;
+    end;
+  finally
+    FQueueLock.Leave;
+  end;
+end;
+
+procedure TRpc.WakeRpcThread;
+begin
+  FQueueLock.Enter;
+  try
+    FQueueEvent.SetEvent;
+  finally
+    FQueueLock.Leave;
+  end;
 end;
 
 destructor TRpcThread.Destroy;
@@ -560,6 +752,50 @@ begin
   Result:=FRpc.Status;
 end;
 
+{ TRpcUserRequest }
+
+constructor TRpcRequestLifetime.Create;
+begin
+  inherited Create;
+  FRefCount:=1;
+  Active:=True;
+end;
+
+procedure TRpcRequestLifetime.AddRef;
+begin
+  Inc(FRefCount);
+end;
+
+procedure TRpcRequestLifetime.Release;
+begin
+  Dec(FRefCount);
+  if FRefCount = 0 then
+    Free;
+end;
+
+constructor TRpcUserRequest.Create(ARequest: TJSONObject; AReturnArguments: boolean;
+  ATimeOut: integer; ACallback: TRpcUserRequestCallback;
+  ALifetime: TRpcRequestLifetime);
+begin
+  inherited Create;
+  Request:=ARequest;
+  ReturnArguments:=AReturnArguments;
+  TimeOut:=ATimeOut;
+  Callback:=ACallback;
+  Lifetime:=ALifetime;
+  if Lifetime <> nil then
+    Lifetime.AddRef;
+end;
+
+destructor TRpcUserRequest.Destroy;
+begin
+  Request.Free;
+  Result.Free;
+  if Lifetime <> nil then
+    Lifetime.Release;
+  inherited Destroy;
+end;
+
 { TRpc }
 
 constructor TRpc.Create;
@@ -567,6 +803,11 @@ begin
   inherited;
   FMainThreadId:=GetCurrentThreadId;
   FLock:=TCriticalSection.Create;
+  FQueueLock:=TCriticalSection.Create;
+  FQueueEvent:=TEvent.Create(nil, False, False, '');
+  FPendingRefresh:=[];
+  FUserRequests:=TList.Create;
+  FStopping:=False;
   HttpLock:=TCriticalSection.Create;
   RefreshNow:=[];
   CreateHttp;
@@ -574,7 +815,21 @@ end;
 
 destructor TRpc.Destroy;
 begin
+  FQueueLock.Enter;
+  try
+    FStopping:=True;
+    FQueueEvent.SetEvent;
+  finally
+    FQueueLock.Leave;
+  end;
+  while FUserRequests.Count > 0 do begin
+    TObject(FUserRequests[0]).Free;
+    FUserRequests.Delete(0);
+  end;
+  FUserRequests.Free;
   Http.Free;
+  FQueueEvent.Free;
+  FQueueLock.Free;
   HttpLock.Free;
   FLock.Free;
   inherited Destroy;
@@ -943,6 +1198,14 @@ begin
   XTorrentSession:='';
   RequestFullInfo:=True;
   ReconnectAllowed:=False;
+  FQueueLock.Enter;
+  try
+    FStopping:=False;
+    FPendingRefresh:=[];
+    FQueueEvent.ResetEvent;
+  finally
+    FQueueLock.Leave;
+  end;
   RefreshNow:=[];
   RpcThread:=TRpcThread.Create;
   with RpcThread do begin
@@ -954,6 +1217,15 @@ end;
 
 procedure TRpc.Disconnect;
 begin
+  FQueueLock.Enter;
+  try
+    FStopping:=True;
+    FPendingRefresh:=[];
+    FQueueEvent.SetEvent;
+  finally
+    FQueueLock.Leave;
+  end;
+  CancelPendingUserRequests;
   if Assigned(RpcThread) then begin
     RpcThread.Terminate;
     while Assigned(RpcThread) do begin

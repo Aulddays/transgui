@@ -15,6 +15,7 @@ inherited DaemonOptionsForm: TDaemonOptionsForm
   Constraints.MinHeight = 340
   Constraints.MinWidth = 400
   OnCreate = FormCreate
+  OnDestroy = FormDestroy
   Position = poMainFormCenter
   object Page: TPageControl[0]
     Left = 8

@@ -25,7 +25,7 @@ interface
 
 uses
   Classes, SysUtils, LazUTF8, LResources, Forms, Controls, Graphics, Dialogs, StdCtrls, ExtCtrls, Spin, ComCtrls, CheckLst, EditBtn, MaskEdit,
-  ButtonPanel, BaseForm;
+  ButtonPanel, BaseForm, rpc, utils;
 
 resourcestring
  sPortTestSuccess = 'Incoming port tested successfully.';
@@ -107,6 +107,9 @@ type
     txPort: TLabel;
     procedure btOKClick(Sender: TObject);
     procedure btTestPortClick(Sender: TObject);
+    procedure PortTestCompleted(ARequest: TObject);
+    procedure SessionGetCompleted(ARequest: TObject);
+    procedure SessionSetCompleted(ARequest: TObject);
     procedure cbAutoAltClick(Sender: TObject);
     procedure cbBlocklistClick(Sender: TObject);
     procedure cbIdleSeedLimitClick(Sender: TObject);
@@ -116,17 +119,25 @@ type
     procedure cbRandomPortClick(Sender: TObject);
     procedure cbSeedRatioClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
   private
-    { private declarations }
+    FRequestLifetime: TRpcRequestLifetime;
+    procedure EnableControls(AEnabled: Boolean);
   public
-    { public declarations }
+    procedure LoadSession;
   end;
 
 implementation
 
-uses main, utils, fpjson;
+uses main, fpjson;
 
 { TDaemonOptionsForm }
+
+procedure TDaemonOptionsForm.FormDestroy(Sender: TObject);
+begin
+  FRequestLifetime.Active:=False;
+  FRequestLifetime.Release;
+end;
 
 procedure TDaemonOptionsForm.cbMaxDownClick(Sender: TObject);
 begin
@@ -135,25 +146,41 @@ end;
 
 procedure TDaemonOptionsForm.btTestPortClick(Sender: TObject);
 var
-  req, res: TJSONObject;
+  req: TJSONObject;
+  request: TRpcUserRequest;
 begin
-  AppBusy;
   req:=TJSONObject.Create;
-  try
-    req.Add('method', 'port-test');
-    res:=RpcObj.SendRequest(req, False);
+  req.Add('method', 'port-test');
+  request:=TRpcUserRequest.Create(req, False, -1, @PortTestCompleted,
+    FRequestLifetime);
+  Enabled:=False;
+  btTestPort.Caption:='Processing...';
+  AppBusy;
+  if not RpcObj.QueueUserRequest(request) then begin
+    Enabled:=True;
+    btTestPort.Caption:='Test port';
     AppNormal;
-    if res = nil then
-      MainForm.CheckStatus(False)
-    else
-      if res.Objects['arguments'].Integers['port-is-open'] <> 0 then
-        MessageDlg(sPortTestSuccess, mtInformation, [mbOk], 0)
-      else
-        MessageDlg(sPortTestFailed, mtError, [mbOK], 0);
-    res.Free;
-  finally
-    req.Free;
+    MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
   end;
+end;
+
+procedure TDaemonOptionsForm.PortTestCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+begin
+  Enabled:=True;
+  btTestPort.Caption:='Test port';
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then
+    MainForm.CheckStatus(False)
+  else
+    if res.Objects['arguments'].Integers['port-is-open'] <> 0 then
+      MessageDlg(sPortTestSuccess, mtInformation, [mbOK], 0)
+    else
+      MessageDlg(sPortTestFailed, mtError, [mbOK], 0);
 end;
 
 procedure TDaemonOptionsForm.cbAutoAltClick(Sender: TObject);
@@ -185,7 +212,253 @@ begin
   edIdleSeedLimit.Enabled:=cbIdleSeedLimit.Checked;
 end;
 
+procedure TDaemonOptionsForm.cbIncompleteDirClick(Sender: TObject);
+begin
+  edIncompleteDir.Enabled:=cbIncompleteDir.Checked;
+  if edIncompleteDir.Enabled then
+    edIncompleteDir.Color:=clWindow
+  else
+    edIncompleteDir.ParentColor:=True;
+end;
+
+procedure TDaemonOptionsForm.cbMaxUpClick(Sender: TObject);
+begin
+  edMaxUp.Enabled:=cbMaxUp.Checked;
+end;
+
+procedure TDaemonOptionsForm.cbRandomPortClick(Sender: TObject);
+begin
+  edPort.Enabled:=not cbRandomPort.Checked;
+end;
+
+procedure TDaemonOptionsForm.cbSeedRatioClick(Sender: TObject);
+begin
+  edSeedRatio.Enabled:=cbSeedRatio.Checked;
+end;
+
+procedure TDaemonOptionsForm.FormCreate(Sender: TObject);
+var
+  i, j, x, wd: integer;
+  cb: TCheckBox;
+begin
+  FRequestLifetime:=TRpcRequestLifetime.Create;
+  bidiMode := GetBiDi();
+  Page.ActivePageIndex:=0;
+  cbEncryption.Items.Add(sEncryptionDisabled);
+  cbEncryption.Items.Add(sEncryptionEnabled);
+  cbEncryption.Items.Add(sEncryptionRequired);
+  Buttons.OKButton.ModalResult:=mrNone;
+  Buttons.OKButton.OnClick:=@btOKClick;
+
+  x:=edAltTimeBegin.Left;
+  wd:=(gbAltSpeed.ClientWidth - x - BorderWidth) div 7;
+  for i:=1 to 7 do begin
+    cb:=TCheckBox.Create(gbAltSpeed);
+    cb.Parent:=gbAltSpeed;
+    j:=i + 1;
+    if j > 7 then
+      Dec(j, 7);
+    cb.Caption:=SysToUTF8(FormatSettings.ShortDayNames[j]);
+    cb.Name:=Format('cbDay%d', [j]);
+    cb.Left:=x;
+    cb.Top:=txDays.Top - (cb.Height - txDays.Height) div 2;
+    Inc(x, wd);
+  end;
+end;
+
+procedure TDaemonOptionsForm.EnableControls(AEnabled: Boolean);
+var
+  i: integer;
+  ctrl: TControl;
+begin
+  // Enable/disable all controls except buttons
+  for i:=0 to ControlCount - 1 do begin
+    ctrl:=Controls[i];
+    if (ctrl <> btTestPort) and (ctrl <> Buttons) then
+      ctrl.Enabled:=AEnabled;
+  end;
+  btTestPort.Enabled:=AEnabled;
+  Buttons.OKButton.Enabled:=AEnabled;
+  Buttons.CancelButton.Enabled:=AEnabled;
+  if AEnabled then begin
+    // Update dependent control states
+    cbMaxDownClick(nil);
+    cbMaxUpClick(nil);
+    cbRandomPortClick(nil);
+    cbSeedRatioClick(nil);
+    cbIncompleteDirClick(nil);
+    cbIdleSeedLimitClick(nil);
+    cbBlocklistClick(nil);
+    cbAutoAltClick(nil);
+  end;
+end;
+
+procedure TDaemonOptionsForm.LoadSession;
+var
+  req: TJSONObject;
+  request: TRpcUserRequest;
+begin
+  FRequestLifetime.AddRef;
+  req:=TJSONObject.Create;
+  req.Add('method', 'session-get');
+  request:=TRpcUserRequest.Create(req, False, -1, @SessionGetCompleted, FRequestLifetime);
+  EnableControls(False);
+  AppBusy;
+  if not RpcObj.QueueUserRequest(request) then begin
+    EnableControls(True);
+    AppNormal;
+    MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+  end;
+end;
+
+procedure TDaemonOptionsForm.SessionGetCompleted(ARequest: TObject);
+var
+  args: TJSONObject;
+  s: string;
+  i, j: integer;
+  cb: TCheckBox;
+begin
+  EnableControls(True);
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  args:=TRpcUserRequest(ARequest).Result;
+  if args = nil then begin
+    MainForm.CheckStatus(False);
+    ModalResult:=mrCancel;
+    exit;
+  end;
+
+  try
+    edDownloadDir.Text:= MainForm.CorrectPath(UTF8Encode(args.Strings['download-dir']));
+    if RpcObj.RPCVersion >= 5 then begin
+      // RPC version 5
+      edPort.Value:=args.Integers['peer-port'];
+      cbPEX.Checked:=args.Integers['pex-enabled'] <> 0;
+      edMaxPeers.Value:=args.Integers['peer-limit-global'];
+      cbRandomPort.Checked:=args.Integers['peer-port-random-on-start'] <> 0;
+      cbDHT.Checked:=args.Integers['dht-enabled'] <> 0;
+      cbSeedRatio.Checked:=args.Integers['seedRatioLimited'] <> 0;
+      edSeedRatio.Value:=args.Floats['seedRatioLimit'];
+      cbBlocklist.Checked:=args.Integers['blocklist-enabled'] <> 0;
+
+      cbAltEnabled.Checked:=args.Integers['alt-speed-enabled'] <> 0;
+      edAltDown.Value:=args.Integers['alt-speed-down'];
+      edAltUp.Value:=args.Integers['alt-speed-up'];
+      cbAutoAlt.Checked:=args.Integers['alt-speed-time-enabled'] <> 0;
+      edAltTimeBegin.Text:=FormatDateTime('hh:nn', args.Integers['alt-speed-time-begin']/MinsPerDay);
+      edAltTimeEnd.Text:=FormatDateTime('hh:nn', args.Integers['alt-speed-time-end']/MinsPerDay);
+      j:=args.Integers['alt-speed-time-day'];
+      for i:=1 to 7 do begin
+        cb:=TCheckBox(gbAltSpeed.FindChildControl(Format('cbDay%d', [i])));
+        if Assigned(cb) then
+          cb.Checked:=LongBool(j and 1);
+        j:=j shr 1;
+      end;
+      cbAutoAltClick(nil);
+    end
+    else begin
+      // RPC versions prior to v5
+      cbPortForwarding.Top:=cbRandomPort.Top;
+      edPort.Value:=args.Integers['port'];
+      cbPEX.Checked:=args.Integers['pex-allowed'] <> 0;
+      edMaxPeers.Value:=args.Integers['peer-limit'];
+      cbRandomPort.Visible:=False;
+      cbDHT.Visible:=False;
+      cbSeedRatio.Visible:=False;
+      edSeedRatio.Visible:=False;
+      btTestPort.Visible:=False;
+      cbBlocklist.Visible:=False;
+      gbAltSpeed.Visible:=False;
+    end;
+
+    if RpcObj.RPCVersion >= 7 then begin
+      cbIncompleteDir.Checked:=args.Integers['incomplete-dir-enabled'] <> 0;
+      edIncompleteDir.Text:=UTF8Encode(args.Strings['incomplete-dir']);
+      cbIncompleteDirClick(nil);
+    end
+    else begin
+      cbIncompleteDir.Visible:=False;
+      edIncompleteDir.Visible:=False;
+    end;
+
+    if RpcObj.RPCVersion >= 8 then
+      cbPartExt.Checked:=args.Integers['rename-partial-files'] <> 0
+    else
+      cbPartExt.Visible:=False;
+
+    if RpcObj.RPCVersion >= 9 then
+      cbLPD.Checked:=args.Integers['lpd-enabled'] <> 0
+    else
+      cbLPD.Visible:=False;
+
+    if RpcObj.RPCVersion >= 10 then begin
+      edCacheSize.Value:=args.Integers['cache-size-mb'];
+      cbIdleSeedLimit.Checked:=args.Integers['idle-seeding-limit-enabled'] <> 0;
+      edIdleSeedLimit.Value:=args.Integers['idle-seeding-limit'];
+      cbIdleSeedLimitClick(nil);
+    end
+    else begin
+      edCacheSize.Visible:=False;
+      txCacheSize.Visible:=False;
+      txMB.Visible:=False;
+      cbIdleSeedLimit.Visible:=False;
+      edIdleSeedLimit.Visible:=False;
+      txMinutes.Visible:=False;
+    end;
+
+    if args.IndexOfName('blocklist-url') >= 0 then
+      edBlocklistURL.Text:=UTF8Encode(args.Strings['blocklist-url'])
+    else begin
+      edBlocklistURL.Visible:=False;
+      cbBlocklist.Left:=cbPEX.Left;
+      cbBlocklist.Caption:=StringReplace(cbBlocklist.Caption, ':', '', [rfReplaceAll]);
+    end;
+    cbBlocklistClick(nil);
+
+    if RpcObj.RPCVersion >= 13 then
+      cbUTP.Checked:=args.Integers['utp-enabled'] <> 0
+    else
+      cbUTP.Visible:=False;
+
+    if RpcObj.RPCVersion >= 14 then begin
+      tabQueue.TabVisible:=True;
+      cbDownQueue.Checked:=args.Integers['download-queue-enabled'] <> 0;
+      edDownQueue.Value:=args.Integers['download-queue-size'];
+      cbUpQueue.Checked:=args.Integers['seed-queue-enabled'] <> 0;
+      edUpQueue.Value:=args.Integers['seed-queue-size'];
+      cbStalled.Checked:=args.Integers['queue-stalled-enabled'] <> 0;
+      edStalledTime.Value:=args.Integers['queue-stalled-minutes'];
+    end
+    else
+      tabQueue.TabVisible:=False;
+
+    cbPortForwarding.Checked:=args.Integers['port-forwarding-enabled'] <> 0;
+    s:=args.Strings['encryption'];
+    if s = 'preferred' then
+      cbEncryption.ItemIndex:=1
+    else
+    if s = 'required' then
+      cbEncryption.ItemIndex:=2
+    else
+      cbEncryption.ItemIndex:=0;
+    cbMaxDown.Checked:=args.Integers['speed-limit-down-enabled'] <> 0;
+    edMaxDown.Value:=args.Integers['speed-limit-down'];
+    cbMaxUp.Checked:=args.Integers['speed-limit-up-enabled'] <> 0;
+    edMaxUp.Value:=args.Integers['speed-limit-up'];
+  finally
+    args.Free;
+  end;
+end;
+
 procedure TDaemonOptionsForm.btOKClick(Sender: TObject);
+var
+  req: TJSONObject;
+  args: TJSONObject;
+  request: TRpcUserRequest;
+  s: string;
+  i, j: integer;
+  cb: TCheckBox;
 begin
   edDownloadDir.Text:=Trim(edDownloadDir.Text);
   if edDownloadDir.Text = '' then begin
@@ -216,60 +489,107 @@ begin
       exit;
     end;
   end;
-  ModalResult:=mrOK;
-end;
 
-procedure TDaemonOptionsForm.cbIncompleteDirClick(Sender: TObject);
-begin
-  edIncompleteDir.Enabled:=cbIncompleteDir.Checked;
-  if edIncompleteDir.Enabled then
-    edIncompleteDir.Color:=clWindow
-  else
-    edIncompleteDir.ParentColor:=True;
-end;
-
-procedure TDaemonOptionsForm.cbMaxUpClick(Sender: TObject);
-begin
-  edMaxUp.Enabled:=cbMaxUp.Checked;
-end;
-
-procedure TDaemonOptionsForm.cbRandomPortClick(Sender: TObject);
-begin
-  edPort.Enabled:=not cbRandomPort.Checked;
-end;
-
-procedure TDaemonOptionsForm.cbSeedRatioClick(Sender: TObject);
-begin
-  edSeedRatio.Enabled:=cbSeedRatio.Checked;
-end;
-
-procedure TDaemonOptionsForm.FormCreate(Sender: TObject);
-var
-  i, j, x, wd: integer;
-  cb: TCheckBox;
-begin
-  bidiMode := GetBiDi();
-  Page.ActivePageIndex:=0;
-  cbEncryption.Items.Add(sEncryptionDisabled);
-  cbEncryption.Items.Add(sEncryptionEnabled);
-  cbEncryption.Items.Add(sEncryptionRequired);
-  Buttons.OKButton.ModalResult:=mrNone;
-  Buttons.OKButton.OnClick:=@btOKClick;
-
-  x:=edAltTimeBegin.Left;
-  wd:=(gbAltSpeed.ClientWidth - x - BorderWidth) div 7;
-  for i:=1 to 7 do begin
-    cb:=TCheckBox.Create(gbAltSpeed);
-    cb.Parent:=gbAltSpeed;
-    j:=i + 1;
-    if j > 7 then
-      Dec(j, 7);
-    cb.Caption:=SysToUTF8(FormatSettings.ShortDayNames[j]);
-    cb.Name:=Format('cbDay%d', [j]);
-    cb.Left:=x;
-    cb.Top:=txDays.Top - (cb.Height - txDays.Height) div 2;
-    Inc(x, wd);
+  req:=TJSONObject.Create;
+  req.Add('method', 'session-set');
+  args:=TJSONObject.Create;
+  args.Add('download-dir', UTF8Decode(edDownloadDir.Text));
+  args.Add('port-forwarding-enabled', integer(cbPortForwarding.Checked) and 1);
+  case cbEncryption.ItemIndex of
+    1: s:='preferred';
+    2: s:='required';
+    else s:='tolerated';
   end;
+  args.Add('encryption', s);
+  args.Add('speed-limit-down-enabled', integer(cbMaxDown.Checked) and 1);
+  if cbMaxDown.Checked then
+    args.Add('speed-limit-down', edMaxDown.Value);
+  args.Add('speed-limit-up-enabled', integer(cbMaxUp.Checked) and 1);
+  if cbMaxUp.Checked then
+    args.Add('speed-limit-up', edMaxUp.Value);
+  if RpcObj.RPCVersion >= 5 then begin
+    args.Add('peer-limit-global', edMaxPeers.Value);
+    args.Add('peer-port', edPort.Value);
+    args.Add('pex-enabled', integer(cbPEX.Checked) and 1);
+    args.Add('peer-port-random-on-start', integer(cbRandomPort.Checked) and 1);
+    args.Add('dht-enabled', integer(cbDHT.Checked) and 1);
+    args.Add('seedRatioLimited', integer(cbSeedRatio.Checked) and 1);
+    if cbSeedRatio.Checked then
+      args.Add('seedRatioLimit', edSeedRatio.Value);
+    args.Add('blocklist-enabled', integer(cbBlocklist.Checked) and 1);
+    if cbBlocklist.Checked and (edBlocklistURL.Text <> '') then
+      args.Add('blocklist-url', UTF8Decode(edBlocklistURL.Text));
+    args.Add('alt-speed-enabled', integer(cbAltEnabled.Checked) and 1);
+    args.Add('alt-speed-down', edAltDown.Value);
+    args.Add('alt-speed-up', edAltUp.Value);
+    args.Add('alt-speed-time-enabled', integer(cbAutoAlt.Checked) and 1);
+    if cbAutoAlt.Checked then begin
+      args.Add('alt-speed-time-begin', Round(StrToTime(edAltTimeBegin.Text)*MinsPerDay));
+      args.Add('alt-speed-time-end', Round(StrToTime(edAltTimeEnd.Text)*MinsPerDay));
+      j:=0;
+      for i:=1 to 7 do begin
+        cb:=TCheckBox(gbAltSpeed.FindChildControl(Format('cbDay%d', [i])));
+        if Assigned(cb) and cb.Checked then
+          j:=j or (1 shl (i-1));
+      end;
+      args.Add('alt-speed-time-day', j);
+    end;
+  end;
+  if RpcObj.RPCVersion >= 7 then begin
+    args.Add('incomplete-dir-enabled', integer(cbIncompleteDir.Checked) and 1);
+    if cbIncompleteDir.Checked then
+      args.Add('incomplete-dir', UTF8Decode(edIncompleteDir.Text));
+  end;
+  if RpcObj.RPCVersion >= 8 then
+    args.Add('rename-partial-files', integer(cbPartExt.Checked) and 1);
+  if RpcObj.RPCVersion >= 9 then
+    args.Add('lpd-enabled', integer(cbLPD.Checked) and 1);
+  if RpcObj.RPCVersion >= 10 then begin
+    args.Add('cache-size-mb', edCacheSize.Value);
+    args.Add('idle-seeding-limit-enabled', integer(cbIdleSeedLimit.Checked) and 1);
+    if cbIdleSeedLimit.Checked then
+      args.Add('idle-seeding-limit', edIdleSeedLimit.Value);
+  end;
+  if RpcObj.RPCVersion >= 13 then
+    args.Add('utp-enabled', integer(cbUTP.Checked) and 1);
+  if RpcObj.RPCVersion >= 14 then begin
+    args.Add('download-queue-enabled', integer(cbDownQueue.Checked) and 1);
+    if cbDownQueue.Checked then
+      args.Add('download-queue-size', edDownQueue.Value);
+    args.Add('seed-queue-enabled', integer(cbUpQueue.Checked) and 1);
+    if cbUpQueue.Checked then
+      args.Add('seed-queue-size', edUpQueue.Value);
+    args.Add('queue-stalled-enabled', integer(cbStalled.Checked) and 1);
+    if cbStalled.Checked then
+      args.Add('queue-stalled-minutes', edStalledTime.Value);
+  end;
+  req.Add('arguments', args);
+
+  request:=TRpcUserRequest.Create(req, True, -1, @SessionSetCompleted, FRequestLifetime);
+  EnableControls(False);
+  btTestPort.Enabled:=False;
+  AppBusy;
+  Self.Update;
+  if not RpcObj.QueueUserRequest(request) then begin
+    EnableControls(True);
+    btTestPort.Enabled:=True;
+    AppNormal;
+    MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+  end;
+end;
+
+procedure TDaemonOptionsForm.SessionSetCompleted(ARequest: TObject);
+begin
+  EnableControls(True);
+  btTestPort.Enabled:=True;
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then begin
+    MainForm.CheckStatus(False);
+    exit;
+  end;
+  ModalResult:=mrOK;
 end;
 
 initialization

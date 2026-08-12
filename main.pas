@@ -702,6 +702,8 @@ type
     FCalcAvg: boolean;
     FPasswords: TStringList;
     FAppProps:TApplicationProperties;
+    FRequestLifetime: TRpcRequestLifetime;
+    FTorrentActionRefresh: boolean;
 
     procedure UpdateUI;
     procedure UpdateUIRpcVersion(RpcVersion: integer);
@@ -779,6 +781,7 @@ type
     procedure FillStatistics(s: TJSONObject);
     procedure CheckStatus(Fatal: boolean = True);
     function TorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject = nil): boolean;
+    function QueueTorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject = nil; ARefresh: boolean = True): boolean;
     function SetFilePriority(TorrentId: integer; const Files: array of integer; const APriority: string): boolean;
     function SetCurrentFilePriority(const APriority: string): boolean;
     procedure SetTorrentPriority(APriority: integer);
@@ -786,6 +789,9 @@ type
     function SelectRemoteFolder(const CurFolder, DialogTitle: string): string;
     procedure ConnectionSettingsChanged(const ActiveConnection: string; ForceReconnect: boolean);
     procedure StatusBarSizes;
+    procedure TorrentActionCompleted(ARequest: TObject);
+    procedure UpdateBlocklistCompleted(ARequest: TObject);
+    procedure DelTrackerCompleted(ARequest: TObject);
 private
     procedure _onException(Sender: TObject; E: Exception);
 end;
@@ -1644,6 +1650,8 @@ begin
   txTorrentHeader.Font.Size:=txTransferHeader.Font.Size;
   TrayIcon.Icon.Assign(Application.Icon);
   RpcObj:=TRpc.Create;
+  FRequestLifetime:=TRpcRequestLifetime.Create;
+  FTorrentActionRefresh:=True;
   FTorrents:=TVarList.Create(gTorrents.Columns.Count, 0);
   FTorrents.ExtraColumns:=TorrentsExtraColumns;
   gTorrents.Items.ExtraColumns:=TorrentsExtraColumns;
@@ -1953,6 +1961,8 @@ begin
     MakeTranslationFile;
   end;
 
+  FRequestLifetime.Active:=False;
+  FRequestLifetime.Release;
   ClearScaledToolbarImages;
   DeleteFileUTF8(FRunFileName);
   FPasswords.Free;
@@ -2045,12 +2055,13 @@ procedure TMainForm.acDelTrackerExecute(Sender: TObject);
 var
   req, args: TJSONObject;
   id, torid: integer;
+  request: TRpcUserRequest;
 begin
   id:=lvTrackers.Items[idxTrackerID, lvTrackers.Row];
   torid:=RpcObj.CurTorrentId;
   if MessageDlg('', Format(SRemoveTracker, [UTF8Encode(widestring(lvTrackers.Items[idxTrackersListName, lvTrackers.Row]))]), mtConfirmation, mbYesNo, 0, mbNo) <> mrYes then exit;
+  acDelTracker.Enabled:=False;
   AppBusy;
-  Self.Update;
   req:=TJSONObject.Create;
   try
     req.Add('method', 'torrent-set');
@@ -2058,18 +2069,29 @@ begin
     args.Add('ids', TJSONArray.Create([torid]));
     args.Add('trackerRemove', TJSONArray.Create([id]));
     req.Add('arguments', args);
-    args:=nil;
-    args:=RpcObj.SendRequest(req, False);
-    if args = nil then begin
-      CheckStatus(False);
+    request:=TRpcUserRequest.Create(req, False, -1, @DelTrackerCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      acDelTracker.Enabled:=True;
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
       exit;
     end;
-    args.Free;
+    req:=nil;
   finally
     req.Free;
   end;
-  DoRefresh;
+end;
+
+procedure TMainForm.DelTrackerCompleted(ARequest: TObject);
+begin
+  acDelTracker.Enabled:=True;
   AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then
+    CheckStatus(False)
+  else
+    DoRefresh;
 end;
 
 procedure TMainForm.acEditTrackerExecute(Sender: TObject);
@@ -2091,12 +2113,12 @@ procedure TMainForm.acFolderGroupingExecute(Sender: TObject);
 begin
   acFolderGrouping.Checked:=not acFolderGrouping.Checked;
   Ini.WriteBool('Interface', 'FolderGrouping', acFolderGrouping.Checked);
-  RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtTorrents];
+  RpcObj.QueueRefresh([rtTorrents]);
 end;
 
 procedure TMainForm.acForceStartTorrentExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'torrent-start-now');
+  QueueTorrentAction(GetSelectedTorrents, 'torrent-start-now');
 end;
 
 procedure TMainForm.acHideAppExecute(Sender: TObject);
@@ -2365,7 +2387,7 @@ begin
   finally
     req.Free;
   end;
-  RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtSession];
+  RpcObj.QueueRefresh([rtSession]);
   AppNormal;
 end;
 
@@ -3341,9 +3363,9 @@ end;
 procedure TMainForm.DoRefresh(All: boolean);
 begin
   if All then
-    RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtTorrents, rtDetails]
+    RpcObj.QueueRefresh([rtTorrents, rtDetails])
   else
-    RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtDetails];
+    RpcObj.QueueRefresh([rtDetails]);
 end;
 
 procedure TMainForm.acDisconnectExecute(Sender: TObject);
@@ -3695,7 +3717,7 @@ begin
       finally
         req.Free;
       end;
-      RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtSession];
+      RpcObj.QueueRefresh([rtSession]);
       AppNormal;
     end;
   finally
@@ -3705,27 +3727,27 @@ end;
 
 procedure TMainForm.acQMoveBottomExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'queue-move-bottom');
+  QueueTorrentAction(GetSelectedTorrents, 'queue-move-bottom');
 end;
 
 procedure TMainForm.acQMoveDownExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'queue-move-down');
+  QueueTorrentAction(GetSelectedTorrents, 'queue-move-down');
 end;
 
 procedure TMainForm.acQMoveTopExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'queue-move-top');
+  QueueTorrentAction(GetSelectedTorrents, 'queue-move-top');
 end;
 
 procedure TMainForm.acQMoveUpExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'queue-move-up');
+  QueueTorrentAction(GetSelectedTorrents, 'queue-move-up');
 end;
 
 procedure TMainForm.acReannounceTorrentExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'torrent-reannounce');
+  QueueTorrentAction(GetSelectedTorrents, 'torrent-reannounce');
 end;
 
 procedure TMainForm.acRemoveTorrentAndDataExecute(Sender: TObject);
@@ -3857,12 +3879,12 @@ end;
 
 procedure TMainForm.acStartAllTorrentsExecute(Sender: TObject);
 begin
-  TorrentAction(NULL, 'torrent-start');
+  QueueTorrentAction(NULL, 'torrent-start');
 end;
 
 procedure TMainForm.acStartTorrentExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'torrent-start');
+  QueueTorrentAction(GetSelectedTorrents, 'torrent-start');
 end;
 
 procedure TMainForm.acStatusBarExecute(Sender: TObject);
@@ -3898,12 +3920,12 @@ end;
 
 procedure TMainForm.acStopAllTorrentsExecute(Sender: TObject);
 begin
-  TorrentAction(NULL, 'torrent-stop');
+  QueueTorrentAction(NULL, 'torrent-stop');
 end;
 
 procedure TMainForm.acStopTorrentExecute(Sender: TObject);
 begin
-  TorrentAction(GetSelectedTorrents, 'torrent-stop');
+  QueueTorrentAction(GetSelectedTorrents, 'torrent-stop');
 end;
 
 procedure TMainForm.gTorrentsMouseMove(Sender: TObject; Shift: TShiftState; X,
@@ -4241,30 +4263,46 @@ procedure TMainForm.acTrackerGroupingExecute(Sender: TObject);
 begin
   acTrackerGrouping.Checked:=not acTrackerGrouping.Checked;
   Ini.WriteBool('Interface', 'TrackerGrouping', acTrackerGrouping.Checked);
-  RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtTorrents];
+  RpcObj.QueueRefresh([rtTorrents]);
 end;
 
 procedure TMainForm.acUpdateBlocklistExecute(Sender: TObject);
 var
   req: TJSONObject;
-  res: TJSONObject;
+  request: TRpcUserRequest;
 begin
-  Application.ProcessMessages;
+  acUpdateBlocklist.Enabled:=False;
   AppBusy;
   req:=TJSONObject.Create;
   try
     req.Add('method', 'blocklist-update');
-    res:=RpcObj.SendRequest(req, True, 3*60000);
-    AppNormal;
-    if res = nil then begin
-      CheckStatus(False);
+    request:=TRpcUserRequest.Create(req, True, 3*60000, @UpdateBlocklistCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      acUpdateBlocklist.Enabled:=True;
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
       exit;
     end;
-    MessageDlg(Format(sBlocklistUpdateComplete, [res.Integers[('blocklist-size')]]), mtInformation, [mbOK], 0);
-    res.Free;
+    req:=nil;
   finally
     req.Free;
   end;
+end;
+
+procedure TMainForm.UpdateBlocklistCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+begin
+  acUpdateBlocklist.Enabled:=True;
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then begin
+    CheckStatus(False);
+    exit;
+  end;
+  MessageDlg(Format(sBlocklistUpdateComplete, [res.Integers['blocklist-size']]), mtInformation, [mbOK], 0);
 end;
 
 procedure TMainForm.acUpdateGeoIPExecute(Sender: TObject);
@@ -4292,7 +4330,7 @@ begin
   finally
     gTorrents.Tag:=0;
   end;
-  TorrentAction(ids, 'torrent-verify');
+  QueueTorrentAction(ids, 'torrent-verify');
 end;
 
 procedure TMainForm.ApplicationPropertiesEndSession(Sender: TObject);
@@ -4953,7 +4991,7 @@ begin
         FSlowResponse.Visible:=True;
 
     if FDetailsWait.Visible then begin
-      if (FDetailsWaitStart = 0) or not (rtDetails in RpcObj.RefreshNow) then begin
+      if (FDetailsWaitStart = 0) or not RpcObj.HasRefresh([rtDetails]) then begin
         FDetailsWaitStart:=0;
         FDetailsWait.Visible:=False;
         panDetailsWait.Visible:=False;
@@ -6482,7 +6520,7 @@ begin
     end;
 
     if RemoveLocalData then
-      RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtSession];
+      RpcObj.QueueRefresh([rtSession]);
   end;
 end;
 
@@ -6994,6 +7032,61 @@ begin
     if not RpcObj.Connected then
       for i:=1 to StatusBar.Panels.Count - 1 do
         StatusBar.Panels[i].Text:='';
+  end;
+end;
+
+procedure TMainForm.TorrentActionCompleted(ARequest: TObject);
+begin
+  AppNormal;
+  UpdateUI;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then
+    CheckStatus(False)
+  else
+    if FTorrentActionRefresh then
+      DoRefresh(True);
+  FTorrentActionRefresh:=True;
+end;
+
+function TMainForm.QueueTorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject; ARefresh: boolean = True): boolean;
+var
+  req: TJSONObject;
+  ids: TJSONArray;
+  i: integer;
+  request: TRpcUserRequest;
+begin
+  Result:=False;
+  if VarIsEmpty(TorrentIds) then
+    exit;
+  FTorrentActionRefresh:=ARefresh;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', AAction);
+    if args = nil then
+      args:=TJSONObject.Create;
+    if not VarIsNull(TorrentIds) then begin
+      ids:=TJSONArray.Create;
+      if VarIsArray(TorrentIds) then begin
+        for i:=VarArrayLowBound(TorrentIds, 1) to VarArrayHighBound(TorrentIds, 1) do
+          ids.Add(integer(TorrentIds[i]));
+      end
+      else
+        ids.Add(integer(TorrentIds));
+      args.Add('ids', ids);
+    end;
+    req.Add('arguments', args);
+    request:=TRpcUserRequest.Create(req, False, 30000, @TorrentActionCompleted, FRequestLifetime);
+    AppBusy;
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      exit;
+    end;
+    req:=nil; // ownership transferred to request
+    Result:=True;
+  finally
+    req.Free;
   end;
 end;
 
@@ -7737,7 +7830,7 @@ begin
   finally
     req.Free;
   end;
-  RpcObj.RefreshNow:=RpcObj.RefreshNow + [rtSession];
+  RpcObj.QueueRefresh([rtSession]);
   AppNormal;
 end;
 
