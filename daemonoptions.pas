@@ -120,8 +120,10 @@ type
     procedure cbSeedRatioClick(Sender: TObject);
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
+    procedure FormShow(Sender: TObject);
   private
     FRequestLifetime: TRpcRequestLifetime;
+    FNeedLoad: boolean;
     procedure EnableControls(AEnabled: Boolean);
   public
     procedure LoadSession;
@@ -242,6 +244,7 @@ var
   cb: TCheckBox;
 begin
   FRequestLifetime:=TRpcRequestLifetime.Create;
+  OnShow:=@FormShow;
   bidiMode := GetBiDi();
   Page.ActivePageIndex:=0;
   cbEncryption.Items.Add(sEncryptionDisabled);
@@ -294,14 +297,21 @@ begin
 end;
 
 procedure TDaemonOptionsForm.LoadSession;
+begin
+  FNeedLoad:=True;
+end;
+
+procedure TDaemonOptionsForm.FormShow(Sender: TObject);
 var
   req: TJSONObject;
   request: TRpcUserRequest;
 begin
+  if not FNeedLoad then exit;
+  FNeedLoad:=False;
   FRequestLifetime.AddRef;
   req:=TJSONObject.Create;
   req.Add('method', 'session-get');
-  request:=TRpcUserRequest.Create(req, False, -1, @SessionGetCompleted, FRequestLifetime);
+  request:=TRpcUserRequest.Create(req, True, -1, @SessionGetCompleted, FRequestLifetime);
   EnableControls(False);
   AppBusy;
   if not RpcObj.QueueUserRequest(request) then begin
@@ -447,7 +457,7 @@ begin
     cbMaxUp.Checked:=args.Integers['speed-limit-up-enabled'] <> 0;
     edMaxUp.Value:=args.Integers['speed-limit-up'];
   finally
-    args.Free;
+    // args 由 TRpcUserRequest 管理生命周期，这里不释放
   end;
 end;
 

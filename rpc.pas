@@ -1216,6 +1216,8 @@ begin
 end;
 
 procedure TRpc.Disconnect;
+var
+  tt: TDateTime;
 begin
   FQueueLock.Enter;
   try
@@ -1228,13 +1230,22 @@ begin
   CancelPendingUserRequests;
   if Assigned(RpcThread) then begin
     RpcThread.Terminate;
+    // 关闭 socket，让正在阻塞的 HTTP 请求立即返回，加速线程退出
+    try
+      Http.Sock.CloseSocket;
+    except
+    end;
+    // 不泵消息的等待：避免重入风险。
+    // 正常情况下 socket 关闭后 HTTP 很快失败，线程在几十毫秒内退出。
+    // 设 5 秒超时兜底，超时则放弃等待（线程仍在后台跑，但对象设为 nil 标志断开）。
+    tt:=Now;
     while Assigned(RpcThread) do begin
-      Application.ProcessMessages;
-      try
-        Http.Sock.CloseSocket;
-      except
-      end;
       Sleep(20);
+      if Now - tt >= 5 / SecsPerDay then begin
+        // 超时：强制置空，避免主线程无限阻塞
+        RpcThread:=nil;
+        break;
+      end;
     end;
   end;
   Status:='';

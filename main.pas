@@ -792,9 +792,22 @@ type
     procedure TorrentActionCompleted(ARequest: TObject);
     procedure UpdateBlocklistCompleted(ARequest: TObject);
     procedure DelTrackerCompleted(ARequest: TObject);
+    procedure AltSpeedCompleted(ARequest: TObject);
+    procedure SpeedLimitCompleted(ARequest: TObject);
+    procedure FilePriorityCompleted(ARequest: TObject);
+    procedure CopyMagnetLinkCompleted(ARequest: TObject);
+    procedure OpenTorrentCompleted(ARequest: TObject);
+    procedure DblClickCheckCompleted(ARequest: TObject);
+    procedure RemoveTorrentCompleted(ARequest: TObject);
+    procedure RenameTorrentCompleted(ARequest: TObject);
 private
+    procedure QueueOpenTorrent(OpenFolderOnly: boolean; UserDef: boolean=false);
+    procedure QueueRemoveTorrent(const Ids: array of integer; RemoveLocalData: boolean);
+    procedure QueueRenameTorrent(AMode: integer; TorrentId: integer; const OldPath, NewName: string; ARow: integer);
     procedure _onException(Sender: TObject; E: Exception);
 end;
+
+procedure DebugLog(const Msg: string);
 
 function ExcludeInvalidChar (path: string): string; // PETROV
 function GetBiDi: TBiDiMode;
@@ -930,6 +943,37 @@ uses
   synacode, ConnOptions, clipbrd, DateUtils, TorrProps, DaemonOptions, About,
   ToolWin, download, ColSetup, AddLink, MoveTorrent, ssl_openssl_lib, AddTracker, lcltype,
   Options, ButtonPanel, BEncode, synautil, Math;
+
+const
+  RM_TORRENT_NAME = 0;
+  RM_FILE_NAME = 1;
+
+type
+  TOpenTorrentContext = class
+    OpenFolderOnly: boolean;
+    UserDef: boolean;
+    TorrentId: integer;
+    Row: integer;
+  end;
+
+  TDblClickContext = class
+    TorrentId: integer;
+    Row: integer;
+    TorrentName: string;
+  end;
+
+  TRemoveTorrentContext = class
+    Ids: array of integer;
+    RemoveLocalData: boolean;
+  end;
+
+  TRenameTorrentContext = class
+    Mode: integer;  // 0 = rmTorrentName, 1 = rmFileName
+    TorrentId: integer;
+    OldPath: string;
+    NewName: string;
+    Row: integer;   // gTorrents row 或 lvFiles row
+  end;
 
   {TMyHashMap}
   function TMyHashMap.DefaultHashKey(const Key: Integer): Integer;
@@ -2152,15 +2196,10 @@ var
   ids: variant;
   i: integer;
   s: string;
-  req: TJSONObject;
-  aids: TJSONArray;
-  args: TJSONObject;
-  ok: boolean;
-  t: TDateTime;
+  idArr: array of integer;
 begin
   if gTorrents.Items.Count = 0 then
     exit;
-  AppBusy;
   with TMoveTorrentForm.Create(Self) do
   try
     gTorrents.Tag:=1;
@@ -2180,52 +2219,19 @@ begin
     else
       s:=UTF8Encode(widestring(gTorrents.Items[idxName, i]));
 
-
     Caption:=Caption + ' - ' + s;
-    AppNormal;
+
+    SetLength(idArr, gTorrents.SelCount);
+    if VarIsArray(ids) then
+      for i:=0 to gTorrents.SelCount - 1 do
+        idArr[i]:=ids[i]
+    else
+      idArr[0]:=ids;
+    SetTorrentIds(idArr);
+
     if ShowModal = mrOk then begin
-      Application.ProcessMessages;
-      AppBusy;
-      req:=TJSONObject.Create;
-      try
-        req.Add('method', 'torrent-set-location');
-        args:=TJSONObject.Create;
-        aids:=TJSONArray.Create;
-        for i:=VarArrayLowBound(ids, 1) to VarArrayHighBound(ids, 1) do
-          aids.Add(integer(ids[i]));
-        args.Add('ids', aids);
-        args.Add('location', TJSONString.Create(UTF8Decode(edTorrentDir.Text)));
-        args.Add('move', TJSONIntegerNumber.Create(integer(cbMoveData.Checked) and 1));
-        req.Add('arguments', args);
-        args:=RpcObj.SendRequest(req, False);
-        args.Free;
-      finally
-        req.Free;
-      end;
-      gTorrents.Tag:=0;
-      AppNormal;
-      if args = nil then
-        CheckStatus(False)
-      else begin
-        SaveDownloadDirs(edTorrentDir, 'LastMoveDir');
-        ok:=False;
-        t:=Now;
-        with gTorrents do
-          while not ok and not Application.Terminated and (Now - t < 20/SecsPerDay) do begin
-            RpcObj.RequestFullInfo:=True;
-            DoRefresh(True);
-            Sleep(200);
-            Application.ProcessMessages;
-            ok:=True;
-            for i:=0 to Items.Count - 1 do
-              if RowSelected[i] then begin
-                if VarIsEmpty(Items[idxPath, i]) or (AnsiCompareText(UTF8Encode(widestring(Items[idxPath, i])), edTorrentDir.Text) <> 0) then begin
-                  ok:=False;
-                  break;
-                end;
-              end;
-          end;
-      end;
+      SaveDownloadDirs(edTorrentDir, 'LastMoveDir');
+      RpcObj.QueueRefresh([rtDetails]);
     end;
   finally
     gTorrents.Tag:=0;
@@ -2370,7 +2376,9 @@ end;
 procedure TMainForm.acAltSpeedExecute(Sender: TObject);
 var
   req, args: TJSONObject;
+  request: TRpcUserRequest;
 begin
+  acAltSpeed.Enabled:=False;
   AppBusy;
   req:=TJSONObject.Create;
   try
@@ -2378,17 +2386,30 @@ begin
     args:=TJSONObject.Create;
     args.Add('alt-speed-enabled', integer(not acAltSpeed.Checked) and 1);
     req.Add('arguments', args);
-    args:=RpcObj.SendRequest(req, False);
-    if args = nil then begin
-      CheckStatus(False);
+    request:=TRpcUserRequest.Create(req, False, -1, @AltSpeedCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      acAltSpeed.Enabled:=True;
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
       exit;
     end;
-    args.Free;
+    req:=nil;
   finally
     req.Free;
   end;
-  RpcObj.QueueRefresh([rtSession]);
+end;
+
+procedure TMainForm.AltSpeedCompleted(ARequest: TObject);
+begin
+  acAltSpeed.Enabled:=True;
   AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then begin
+    CheckStatus(False);
+    exit;
+  end;
+  RpcObj.QueueRefresh([rtSession]);
 end;
 
 procedure TMainForm.acBigToolbarExecute(Sender: TObject);
@@ -3483,243 +3504,12 @@ begin
 end;
 
 procedure TMainForm.acDaemonOptionsExecute(Sender: TObject);
-var
-  req, args: TJSONObject;
-  s: string;
-  i, j: integer;
 begin
   with TDaemonOptionsForm.Create(Self) do
   try
-    AppBusy;
-    req:=TJSONObject.Create;
-    try
-      req.Add('method', 'session-get');
-      args:=RpcObj.SendRequest(req);
-      if args <> nil then
-        try
-          edDownloadDir.Text:= CorrectPath(UTF8Encode(args.Strings['download-dir']));
-          if RpcObj.RPCVersion >= 5 then begin
-            // RPC version 5
-            edPort.Value:=args.Integers['peer-port'];
-            cbPEX.Checked:=args.Integers['pex-enabled'] <> 0;
-            edMaxPeers.Value:=args.Integers['peer-limit-global'];
-            cbRandomPort.Checked:=args.Integers['peer-port-random-on-start'] <> 0;
-            cbDHT.Checked:=args.Integers['dht-enabled'] <> 0;
-            cbSeedRatio.Checked:=args.Integers['seedRatioLimited'] <> 0;
-            edSeedRatio.Value:=args.Floats['seedRatioLimit'];
-            cbBlocklist.Checked:=args.Integers['blocklist-enabled'] <> 0;
-
-            cbAltEnabled.Checked:=args.Integers['alt-speed-enabled'] <> 0;
-            edAltDown.Value:=args.Integers['alt-speed-down'];
-            edAltUp.Value:=args.Integers['alt-speed-up'];
-            cbAutoAlt.Checked:=args.Integers['alt-speed-time-enabled'] <> 0;
-            edAltTimeBegin.Text:=FormatDateTime('hh:nn', args.Integers['alt-speed-time-begin']/MinsPerDay);
-            edAltTimeEnd.Text:=FormatDateTime('hh:nn', args.Integers['alt-speed-time-end']/MinsPerDay);
-            j:=args.Integers['alt-speed-time-day'];
-            for i:=1 to 7 do begin
-              TCheckBox(gbAltSpeed.FindChildControl(Format('cbDay%d', [i]))).Checked:=LongBool(j and 1);
-              j:=j shr 1;
-            end;
-            cbAutoAltClick(nil);
-          end
-          else begin
-            // RPC versions prior to v5
-            cbPortForwarding.Top:=cbRandomPort.Top;
-            edPort.Value:=args.Integers['port'];
-            cbPEX.Checked:=args.Integers['pex-allowed'] <> 0;
-            edMaxPeers.Value:=args.Integers['peer-limit'];
-            cbRandomPort.Visible:=False;
-            cbDHT.Visible:=False;
-            cbSeedRatio.Visible:=False;
-            edSeedRatio.Visible:=False;
-            btTestPort.Visible:=False;
-            cbBlocklist.Visible:=False;
-            gbAltSpeed.Visible:=False;
-          end;
-
-          if RpcObj.RPCVersion >= 7 then begin
-            cbIncompleteDir.Checked:=args.Integers['incomplete-dir-enabled'] <> 0;
-            edIncompleteDir.Text:=UTF8Encode(args.Strings['incomplete-dir']);
-            cbIncompleteDirClick(nil);
-          end
-          else begin
-            cbIncompleteDir.Visible:=False;
-            edIncompleteDir.Visible:=False;
-          end;
-
-          if RpcObj.RPCVersion >= 8 then
-            cbPartExt.Checked:=args.Integers['rename-partial-files'] <> 0
-          else
-            cbPartExt.Visible:=False;
-
-          if RpcObj.RPCVersion >= 9 then
-            cbLPD.Checked:=args.Integers['lpd-enabled'] <> 0
-          else
-            cbLPD.Visible:=False;
-
-          if RpcObj.RPCVersion >= 10 then begin
-            edCacheSize.Value:=args.Integers['cache-size-mb'];
-            cbIdleSeedLimit.Checked:=args.Integers['idle-seeding-limit-enabled'] <> 0;
-            edIdleSeedLimit.Value:=args.Integers['idle-seeding-limit'];
-            cbIdleSeedLimitClick(nil);
-          end
-          else begin
-            edCacheSize.Visible:=False;
-            txCacheSize.Visible:=False;
-            txMB.Visible:=False;
-            cbIdleSeedLimit.Visible:=False;
-            edIdleSeedLimit.Visible:=False;
-            txMinutes.Visible:=False;
-          end;
-
-          if args.IndexOfName('blocklist-url') >= 0 then
-            edBlocklistURL.Text:=UTF8Encode(args.Strings['blocklist-url'])
-          else begin
-            edBlocklistURL.Visible:=False;
-            cbBlocklist.Left:=cbPEX.Left;
-            cbBlocklist.Caption:=StringReplace(cbBlocklist.Caption, ':', '', [rfReplaceAll]);
-          end;
-          cbBlocklistClick(nil);
-
-          if RpcObj.RPCVersion >= 13 then
-            cbUTP.Checked:=args.Integers['utp-enabled'] <> 0
-          else
-            cbUTP.Visible:=False;
-
-          if RpcObj.RPCVersion >= 14 then begin
-            tabQueue.TabVisible:=True;
-            cbDownQueue.Checked:=args.Integers['download-queue-enabled'] <> 0;
-            edDownQueue.Value:=args.Integers['download-queue-size'];
-            cbUpQueue.Checked:=args.Integers['seed-queue-enabled'] <> 0;
-            edUpQueue.Value:=args.Integers['seed-queue-size'];
-            cbStalled.Checked:=args.Integers['queue-stalled-enabled'] <> 0;
-            edStalledTime.Value:=args.Integers['queue-stalled-minutes'];
-          end
-          else
-            tabQueue.TabVisible:=False;
-
-          cbPortForwarding.Checked:=args.Integers['port-forwarding-enabled'] <> 0;
-          s:=args.Strings['encryption'];
-          if s = 'preferred' then
-            cbEncryption.ItemIndex:=1
-          else
-          if s = 'required' then
-            cbEncryption.ItemIndex:=2
-          else
-            cbEncryption.ItemIndex:=0;
-          cbMaxDown.Checked:=args.Integers['speed-limit-down-enabled'] <> 0;
-          edMaxDown.Value:=args.Integers['speed-limit-down'];
-          cbMaxUp.Checked:=args.Integers['speed-limit-up-enabled'] <> 0;
-          edMaxUp.Value:=args.Integers['speed-limit-up'];
-        finally
-          args.Free;
-        end
-      else begin
-        CheckStatus(False);
-        exit;
-      end;
-    finally
-      req.Free;
-    end;
-    cbMaxDownClick(nil);
-    cbMaxUpClick(nil);
-    cbRandomPortClick(nil);
-    cbSeedRatioClick(nil);
-    AppNormal;
-
-    if ShowModal = mrOK then begin
-      AppBusy;
-      Self.Update;
-      req:=TJSONObject.Create;
-      try
-        req.Add('method', 'session-set');
-        args:=TJSONObject.Create;
-        args.Add('download-dir', UTF8Decode(edDownloadDir.Text));
-        args.Add('port-forwarding-enabled', integer(cbPortForwarding.Checked) and 1);
-        case cbEncryption.ItemIndex of
-          1: s:='preferred';
-          2: s:='required';
-          else s:='tolerated';
-        end;
-        args.Add('encryption', s);
-        args.Add('speed-limit-down-enabled', integer(cbMaxDown.Checked) and 1);
-        if cbMaxDown.Checked then
-          args.Add('speed-limit-down', edMaxDown.Value);
-        args.Add('speed-limit-up-enabled', integer(cbMaxUp.Checked) and 1);
-        if cbMaxUp.Checked then
-          args.Add('speed-limit-up', edMaxUp.Value);
-        if RpcObj.RPCVersion >= 5 then begin
-          args.Add('peer-limit-global', edMaxPeers.Value);
-          args.Add('peer-port', edPort.Value);
-          args.Add('pex-enabled', integer(cbPEX.Checked) and 1);
-          args.Add('peer-port-random-on-start', integer(cbRandomPort.Checked) and 1);
-          args.Add('dht-enabled', integer(cbDHT.Checked) and 1);
-          args.Add('seedRatioLimited', integer(cbSeedRatio.Checked) and 1);
-          if cbSeedRatio.Checked then
-            args.Add('seedRatioLimit', edSeedRatio.Value);
-          args.Add('blocklist-enabled', integer(cbBlocklist.Checked) and 1);
-
-          args.Add('alt-speed-enabled', integer(cbAltEnabled.Checked) and 1);
-          args.Add('alt-speed-down', edAltDown.Value);
-          args.Add('alt-speed-up', edAltUp.Value);
-          args.Add('alt-speed-time-enabled', integer(cbAutoAlt.Checked) and 1);
-          if cbAutoAlt.Checked then begin
-            args.Add('alt-speed-time-begin', Round(Frac(StrToTime(edAltTimeBegin.Text))*MinsPerDay));
-            args.Add('alt-speed-time-end', Round(Frac(StrToTime(edAltTimeEnd.Text))*MinsPerDay));
-            j:=0;
-            for i:=7 downto 1 do begin
-              j:=j shl 1;
-              j:=j or (integer(TCheckBox(gbAltSpeed.FindChildControl(Format('cbDay%d', [i]))).Checked) and 1);
-            end;
-            args.Add('alt-speed-time-day', j);
-          end;
-        end
-        else begin
-          args.Add('peer-limit', edMaxPeers.Value);
-          args.Add('port', edPort.Value);
-          args.Add('pex-allowed', integer(cbPEX.Checked) and 1);
-        end;
-        if RpcObj.RPCVersion >= 7 then begin
-          args.Add('incomplete-dir-enabled', integer(cbIncompleteDir.Checked) and 1);
-          if cbIncompleteDir.Checked then
-            args.Add('incomplete-dir', UTF8Decode(edIncompleteDir.Text));
-        end;
-        if RpcObj.RPCVersion >= 8 then
-          args.Add('rename-partial-files', integer(cbPartExt.Checked) and 1);
-        if RpcObj.RPCVersion >= 9 then
-          args.Add('lpd-enabled', integer(cbLPD.Checked) and 1);
-        if RpcObj.RPCVersion >= 10 then begin
-          args.Add('cache-size-mb', edCacheSize.Value);
-          args.Add('idle-seeding-limit-enabled', integer(cbIdleSeedLimit.Checked) and 1);
-          args.Add('idle-seeding-limit', edIdleSeedLimit.Value);
-        end;
-        if edBlocklistURL.Visible then
-          if cbBlocklist.Checked then
-            args.Add('blocklist-url', UTF8Decode(edBlocklistURL.Text));
-        if RpcObj.RPCVersion >= 13 then
-          args.Add('utp-enabled', integer(cbUTP.Checked) and 1);
-        if RpcObj.RPCVersion >= 14 then begin
-          args.Add('download-queue-enabled', integer(cbDownQueue.Checked) and 1);
-          args.Add('download-queue-size', edDownQueue.Value);
-          args.Add('seed-queue-enabled', integer(cbUpQueue.Checked) and 1);
-          args.Add('seed-queue-size', edUpQueue.Value);
-          args.Add('queue-stalled-enabled', integer(cbStalled.Checked) and 1);
-          args.Add('queue-stalled-minutes', edStalledTime.Value);
-        end;
-
-        req.Add('arguments', args);
-        args:=RpcObj.SendRequest(req, False);
-        if args = nil then begin
-          CheckStatus(False);
-          exit;
-        end;
-        args.Free;
-      finally
-        req.Free;
-      end;
+    LoadSession;
+    if ShowModal = mrOK then
       RpcObj.QueueRefresh([rtSession]);
-      AppNormal;
-    end;
   finally
     Free;
   end;
@@ -3998,264 +3788,38 @@ begin
 end;
 
 procedure TMainForm.TorrentProps(PageNo: integer);
-const
-  TR_RATIOLIMIT_GLOBAL    = 0; // follow the global settings
-  TR_RATIOLIMIT_SINGLE    = 1; // override the global settings, seeding until a certain ratio
-  TR_RATIOLIMIT_UNLIMITED = 2; // override the global settings, seeding regardless of ratio
-
-  TR_IDLELIMIT_GLOBAL     = 0; // follow the global settings
-  TR_IDLELIMIT_SINGLE     = 1; // override the global settings, seeding until a certain idle time
-  TR_IDLELIMIT_UNLIMITED  = 2; // override the global settings, seeding regardless of activity
-
 var
-  req, args, t, tr: TJSONObject;
-  i, j, id: integer;
-  ids, Trackers, AddT, EditT, DelT: TJSONArray;
   TorrentIds: variant;
-  s: string;
-  trlist, sl: TStringList;
+  idArr: array of integer;
+  i: integer;
 begin
   gTorrentsClick(nil);
-  id:=RpcObj.CurTorrentId;
-  if id = 0 then exit;
-  AppBusy;
-  trlist:=nil;
-  with TTorrPropsForm.Create(Self) do
+  if RpcObj.CurTorrentId = 0 then exit;
+  gTorrents.Tag:=1;
   try
-    Page.ActivePageIndex:=PageNo;
-    gTorrents.Tag:=1;
     gTorrents.EnsureSelectionVisible;
     TorrentIds:=GetSelectedTorrents;
-    args:=RpcObj.RequestInfo(id, ['downloadLimit', 'downloadLimitMode', 'downloadLimited', 'uploadLimit', 'uploadLimitMode', 'uploadLimited',
-                                  'name', 'maxConnectedPeers', 'seedRatioMode', 'seedRatioLimit', 'seedIdleLimit', 'seedIdleMode', 'trackers']);
-    if args = nil then begin
-      CheckStatus(False);
-      exit;
+
+    if VarIsArray(TorrentIds) then begin
+      SetLength(idArr, VarArrayHighBound(TorrentIds, 1) + 1);
+      for i:=0 to High(idArr) do
+        idArr[i]:=TorrentIds[i];
+    end
+    else begin
+      SetLength(idArr, 1);
+      idArr[0]:=TorrentIds;
     end;
+
+    with TTorrPropsForm.Create(Self) do
     try
-      t:=args.Arrays['torrents'].Objects[0];
-
-      if gTorrents.SelCount > 1 then
-        s:=Format(sSeveralTorrents, [gTorrents.SelCount])
-      else
-        s:=UTF8Encode(t.Strings['name']);
-
-      txName.Caption:=txName.Caption + ' ' + s;
-      Caption:=Caption + ' - ' + s;
-      if RpcObj.RPCVersion < 5 then begin
-        // RPC versions prior to v5
-        j:=t.Integers['downloadLimitMode'];
-        cbMaxDown.Checked:=j = TR_SPEEDLIMIT_SINGLE;
-        i:=t.Integers['downloadLimit'];
-        if (i < 0) or (j = TR_SPEEDLIMIT_UNLIMITED) then
-          edMaxDown.ValueEmpty:=True
-        else
-          edMaxDown.Value:=i;
-
-        j:=t.Integers['uploadLimitMode'];
-        cbMaxUp.Checked:=j = TR_SPEEDLIMIT_SINGLE;
-        i:=t.Integers['uploadLimit'];
-        if (i < 0) or (j = TR_SPEEDLIMIT_UNLIMITED) then
-          edMaxUp.ValueEmpty:=True
-        else
-          edMaxUp.Value:=i;
-        cbSeedRatio.Visible:=False;
-        edSeedRatio.Visible:=False;
-      end else begin
-        // RPC version 5
-        cbMaxDown.Checked:=t.Booleans['downloadLimited'];
-        i:=t.Integers['downloadLimit'];
-        if i < 0 then
-          edMaxDown.ValueEmpty:=True
-        else
-          edMaxDown.Value:=i;
-
-        cbMaxUp.Checked:=t.Booleans['uploadLimited'];
-        i:=t.Integers['uploadLimit'];
-        if i < 0 then
-          edMaxUp.ValueEmpty:=True
-        else
-          edMaxUp.Value:=i;
-
-        case t.Integers['seedRatioMode'] of
-          TR_RATIOLIMIT_SINGLE:
-            cbSeedRatio.State:=cbChecked;
-          TR_RATIOLIMIT_UNLIMITED:
-            cbSeedRatio.State:=cbUnchecked;
-          else
-            cbSeedRatio.State:=cbGrayed;
-        end;
-        edSeedRatio.Value:=t.Floats['seedRatioLimit'];
-      end;
-
-      if RpcObj.RPCVersion >= 10 then begin
-        case t.Integers['seedIdleMode'] of
-          TR_IDLELIMIT_SINGLE:
-            cbIdleSeedLimit.State:=cbChecked;
-          TR_IDLELIMIT_UNLIMITED:
-            cbIdleSeedLimit.State:=cbUnchecked;
-          else
-            cbIdleSeedLimit.State:=cbGrayed;
-        end;
-        edIdleSeedLimit.Value:=t.Integers['seedIdleLimit'];
-        cbIdleSeedLimitClick(nil);
-
-        trlist:=TStringList.Create;
-        Trackers:=t.Arrays['trackers'];
-        for i:=0 to Trackers.Count - 1 do begin
-          tr:=Trackers[i] as TJSONObject;
-            trlist.AddObject(UTF8Decode(tr.Strings['announce']), TObject(PtrUInt(tr.Integers['id'])));
-        end;
-        edTrackers.Lines.Assign(trlist);
-      end
-      else begin
-        cbIdleSeedLimit.Visible:=False;
-        edIdleSeedLimit.Visible:=False;
-        txMinutes.Visible:=False;
-        tabAdvanced.TabVisible:=False;
-      end;
-      edPeerLimit.Value:=t.Integers['maxConnectedPeers'];
+      LoadTorrent(idArr, gTorrents.SelCount, PageNo);
+      if ShowModal = mrOK then
+        DoRefresh;
     finally
-      args.Free;
-    end;
-    cbMaxDownClick(nil);
-    cbMaxUpClick(nil);
-    cbSeedRatioClick(nil);
-    AppNormal;
-    if ShowModal = mrOk then begin
-      AppBusy;
-      Self.Update;
-      req:=TJSONObject.Create;
-      try
-        req.Add('method', 'torrent-set');
-        args:=TJSONObject.Create;
-        ids:=TJSONArray.Create;
-        for i:=VarArrayLowBound(TorrentIds, 1) to VarArrayHighBound(TorrentIds, 1) do
-          ids.Add(integer(TorrentIds[i]));
-        args.Add('ids', ids);
-
-        if RpcObj.RPCVersion < 5 then
-        begin
-          // RPC versions prior to v5
-          args.Add('speed-limit-down-enabled', integer(cbMaxDown.Checked) and 1);
-          args.Add('speed-limit-up-enabled', integer(cbMaxUp.Checked) and 1);
-          if cbMaxDown.Checked then
-            args.Add('speed-limit-down', edMaxDown.Value);
-          if cbMaxUp.Checked then
-            args.Add('speed-limit-up', edMaxUp.Value);
-        end else begin
-          // RPC version 5
-          args.Add('downloadLimited', integer(cbMaxDown.Checked) and 1);
-          args.Add('uploadLimited', integer(cbMaxUp.Checked) and 1);
-          if cbMaxDown.Checked then
-            args.Add('downloadLimit', edMaxDown.Value);
-          if cbMaxUp.Checked then
-            args.Add('uploadLimit', edMaxUp.Value);
-          case cbSeedRatio.State of
-            cbChecked:
-              i:=TR_RATIOLIMIT_SINGLE;
-            cbUnchecked:
-              i:=TR_RATIOLIMIT_UNLIMITED;
-            else
-              i:=TR_RATIOLIMIT_GLOBAL;
-          end;
-          args.Add('seedRatioMode', i);
-          if cbSeedRatio.State = cbChecked then
-            args.Add('seedRatioLimit', edSeedRatio.Value);
-        end;
-
-        if RpcObj.RPCVersion >= 10 then begin
-          case cbIdleSeedLimit.State of
-            cbChecked:
-              i:=TR_IDLELIMIT_SINGLE;
-            cbUnchecked:
-              i:=TR_IDLELIMIT_UNLIMITED;
-            else
-              i:=TR_IDLELIMIT_GLOBAL;
-          end;
-          args.Add('seedIdleMode', i);
-          if cbIdleSeedLimit.State = cbChecked then
-            args.Add('seedIdleLimit', edIdleSeedLimit.Value);
-
-          sl:=TStringList.Create;
-          try
-            sl.Assign(edTrackers.Lines);
-            // Removing unchanged trackers
-            i:=0;
-            while i < sl.Count do begin
-              s:=Trim(sl[i]);
-              if s = '' then begin
-                sl.Delete(i);
-                continue;
-              end;
-              j:=trlist.IndexOf(s);
-              if j >= 0 then begin
-                trlist.Delete(j);
-                sl.Delete(i);
-                continue;
-              end;
-              Inc(i);
-            end;
-
-            AddT:=TJSONArray.Create;
-            EditT:=TJSONArray.Create;
-            DelT:=TJSONArray.Create;
-            try
-              for i:=0 to sl.Count - 1 do begin
-                s:=Trim(sl[i]);
-                if trlist.Count > 0 then begin
-                  EditT.Add(PtrUInt(trlist.Objects[0]));
-                  EditT.Add(UTF8Decode(s));
-                  trlist.Delete(0);
-                end
-                else
-                  AddT.Add(UTF8Decode(s));
-              end;
-
-              for i:=0 to trlist.Count - 1 do
-                DelT.Add(PtrUInt(trlist.Objects[i]));
-
-              if AddT.Count > 0 then begin
-                args.Add('trackerAdd', AddT);
-                AddT:=nil;
-              end;
-              if EditT.Count > 0 then begin
-                args.Add('trackerReplace', EditT);
-                EditT:=nil;
-              end;
-              if DelT.Count > 0 then begin
-                args.Add('trackerRemove', DelT);
-                DelT:=nil;
-              end;
-            finally
-              DelT.Free;
-              EditT.Free;
-              AddT.Free;
-            end;
-          finally
-            sl.Free;
-          end;
-        end;
-
-        args.Add('peer-limit', edPeerLimit.Value);
-        req.Add('arguments', args);
-        args:=nil;
-        args:=RpcObj.SendRequest(req, False);
-        if args = nil then begin
-          CheckStatus(False);
-          exit;
-        end;
-        args.Free;
-      finally
-        req.Free;
-      end;
-      DoRefresh;
-      AppNormal;
+      Free;
     end;
   finally
     gTorrents.Tag:=0;
-    Free;
-    trlist.Free;
   end;
 end;
 
@@ -4560,33 +4124,81 @@ end;
 
 procedure TMainForm.gTorrentsDblClick(Sender: TObject);
 var
-  res: TJSONObject;
-  s, n: string;
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+  ctx: TDblClickContext;
 begin
   if gTorrents.Items.Count = 0 then
     exit;
-  if gTorrents.Items[idxDone, gTorrents.Row] = 100.0 then begin
-    // The torrent is finished. Check if it is possible to open its file/folder
-    AppBusy;
-    try
-      res:=RpcObj.RequestInfo(gTorrents.Items[idxTorrentId, gTorrents.Row], ['downloadDir']);
-      if res = nil then
-        CheckStatus(False);
+  if gTorrents.Items[idxDone, gTorrents.Row] <> 100.0 then begin
+    acTorrentProps.Execute;
+    exit;
+  end;
+
+  // The torrent is finished. Check if it is possible to open its file/folder
+  AppBusy;
+  ctx:=TDblClickContext.Create;
+  ctx.TorrentId:=gTorrents.Items[idxTorrentId, gTorrents.Row];
+  ctx.Row:=gTorrents.Row;
+  ctx.TorrentName:=UTF8Encode(widestring(gTorrents.Items[idxName, gTorrents.Row]));
+
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-get');
+    args:=TJSONObject.Create;
+    args.Add('ids', TJSONArray.Create([ctx.TorrentId]));
+    args.Add('fields', TJSONArray.Create(['downloadDir']));
+    req.Add('arguments', args);
+
+    request:=TRpcUserRequest.Create(req, True, -1, @DblClickCheckCompleted, FRequestLifetime);
+    request.Context:=ctx;
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      ctx.Free;
+      acTorrentProps.Execute;
+      exit;
+    end;
+    req:=nil;
+    ctx:=nil;
+  finally
+    req.Free;
+    ctx.Free;
+  end;
+end;
+
+procedure TMainForm.DblClickCheckCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+  ctx: TDblClickContext;
+  s, n: string;
+  canOpen: boolean;
+begin
+  AppNormal;
+  canOpen:=False;
+  if not TRpcUserRequest(ARequest).Cancelled then begin
+    ctx:=TDblClickContext(TRpcUserRequest(ARequest).Context);
+    res:=TRpcUserRequest(ARequest).Result;
+    if res <> nil then begin
       with res.Arrays['torrents'].Objects[0] do
-        n:=IncludeProperTrailingPathDelimiter(UTF8Encode(Strings['downloadDir'])) + UTF8Encode(widestring(gTorrents.Items[idxName, gTorrents.Row]));
+        n:=IncludeProperTrailingPathDelimiter(UTF8Encode(Strings['downloadDir'])) + ctx.TorrentName;
       s:=MapRemoteToLocal(n);
       if s = '' then
         s:=n;
-      if FileExistsUTF8(s) or DirectoryExistsUTF8(s) then begin
-        // File/folder exists - open it
-        OpenCurrentTorrent(False);
-        exit;
-      end;
-    finally
-      AppNormal;
+      canOpen:=FileExistsUTF8(s) or DirectoryExistsUTF8(s);
+    end
+    else begin
+      CheckStatus(False);
     end;
+    ctx.Free;
   end;
-  acTorrentProps.Execute;
+
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+
+  if canOpen then
+    OpenCurrentTorrent(False)
+  else
+    acTorrentProps.Execute;
 end;
 
 procedure TMainForm.gTorrentsDrawCell(Sender: TVarGrid; ACol, ARow, ADataCol: integer; AState: TGridDrawState; const R: TRect; var ADefaultDrawing: boolean);
@@ -4636,11 +4248,17 @@ begin
 end;
 
 procedure TMainForm.gTorrentsSetEditText(Sender: TObject; ACol, ARow: Integer; const Value: string);
+var
+  oldName: string;
+  newName: string;
+  tid: integer;
 begin
-  if RenameTorrent(gTorrents.Items[idxTorrentId, ARow], UTF8Encode(widestring(gTorrents.Items[idxName, ARow])), Trim(Value)) then begin
-    gTorrents.Items[idxName, ARow]:=UTF8Decode(Trim(Value));
-    FFilesTree.Clear;
-  end;
+  newName:=Trim(Value);
+  oldName:=UTF8Encode(widestring(gTorrents.Items[idxName, ARow]));
+  if ExtractFileName(oldName) = newName then
+    exit;
+  tid:=gTorrents.Items[idxTorrentId, ARow];
+  QueueRenameTorrent(RM_TORRENT_NAME, tid, oldName, newName, ARow);
 end;
 
 procedure TMainForm.gTorrentsSortColumn(Sender: TVarGrid; var ASortCol: integer);
@@ -4680,30 +4298,15 @@ end;
 
 procedure TMainForm.lvFilesSetEditText(Sender: TObject; ACol, ARow: Integer; const Value: string);
 var
-  p: string;
-  i, lvl, len: integer;
+  p, newName: string;
+  tid: integer;
 begin
   p:=FFilesTree.GetFullPath(ARow, False);
-  if RenameTorrent(gTorrents.Items[idxTorrentId, gTorrents.Row], p, Trim(Value)) then begin
-    FFiles[idxFileName, ARow]:=UTF8Decode(Trim(Value));
-    if FFilesTree.IsFolder(ARow) then begin
-      // Updating path for child elements
-      len:=Length(p);
-      p:=ExtractFilePath(p) + Trim(Value);
-      lvl:=FFilesTree.RowLevel[ARow];
-      FFiles.BeginUpdate;
-      try
-        FFiles[idxFileFullPath, ARow]:=UTF8Decode(p + RemotePathDelimiter);
-        for i:=ARow + 1 to FFiles.Count - 1 do
-          if FFilesTree.RowLevel[i] > lvl then
-            FFiles[idxFileFullPath, i]:=UTF8Decode(p + Copy(UTF8Encode(widestring(FFiles[idxFileFullPath, i])), len + 1, MaxInt))
-          else
-            break;
-      finally
-        FFiles.EndUpdate;
-      end;
-    end;
-  end;
+  newName:=Trim(Value);
+  if ExtractFileName(p) = newName then
+    exit;
+  tid:=gTorrents.Items[idxTorrentId, gTorrents.Row];
+  QueueRenameTorrent(RM_FILE_NAME, tid, p, newName, ARow);
 end;
 
 procedure TMainForm.lvFilterCellAttributes(Sender: TVarGrid; ACol, ARow, ADataCol: integer; AState: TGridDrawState; var CellAttribs: TCellAttributes);
@@ -4842,41 +4445,62 @@ end;
 
 procedure TMainForm.MenuItem101Click(Sender: TObject);
 var
-  req, args, tt: TJSONObject;
-  ids, t: TJSONArray;
+  req, args: TJSONObject;
+  ids: TJSONArray;
   i: Integer;
   TorrentIds: Variant;
-  Magnets: TStringList;
+  request: TRpcUserRequest;
 begin
   TorrentIds:=GetSelectedTorrents;
+  AppBusy;
   req:=TJSONObject.Create;
-  args:=TJSONObject.Create;
-  Magnets:=TStringList.Create;
   try
     req.Add('method', 'torrent-get');
+    args:=TJSONObject.Create;
     ids:=TJSONArray.Create;
     for i:=VarArrayLowBound(TorrentIds, 1) to VarArrayHighBound(TorrentIds, 1) do
       ids.Add(integer(TorrentIds[i]));
     args.Add('ids', ids);
     args.Add('fields', TJSONArray.Create(['magnetLink']));
     req.Add('arguments', args);
-    args:=RpcObj.SendRequest(req);
-    if args = nil then begin
-      CheckStatus(False);
+    request:=TRpcUserRequest.Create(req, True, -1, @CopyMagnetLinkCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
       exit;
     end;
-    t:=TJSONArray.Create;
-    t:=args.Arrays['torrents'];
-    for i:= 0 to t.Count-1 do
-      begin
-        tt:=t.Objects[i] as TJSONObject;
-        Magnets.add(tt.Strings['magnetLink']);
-      end;
-    FLastClipboardLink := Magnets.Text;   // To Avoid TransGUI detect again this existing links
-    Clipboard.AsText := Magnets.Text;
+    req:=nil;
   finally
     req.Free;
-    args.Free;
+  end;
+end;
+
+procedure TMainForm.CopyMagnetLinkCompleted(ARequest: TObject);
+var
+  args: TJSONObject;
+  t: TJSONArray;
+  tt: TJSONObject;
+  i: integer;
+  Magnets: TStringList;
+begin
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  args:=TRpcUserRequest(ARequest).Result;
+  if args = nil then begin
+    CheckStatus(False);
+    exit;
+  end;
+  Magnets:=TStringList.Create;
+  try
+    t:=args.Arrays['torrents'];
+    for i:=0 to t.Count - 1 do begin
+      tt:=t.Objects[i] as TJSONObject;
+      Magnets.Add(tt.Strings['magnetLink']);
+    end;
+    FLastClipboardLink := Magnets.Text;
+    Clipboard.AsText := Magnets.Text;
+  finally
     Magnets.Free;
   end;
 end;
@@ -6476,10 +6100,10 @@ end;
 
 procedure TMainForm.InternalRemoveTorrent(const Msg, MsgMulti: string; RemoveLocalData: boolean);
 var
-  args: TJSONObject;
   ids: variant;
   s: string;
-  i, j, id: integer;
+  i: integer;
+  idArr: array of integer;
 begin
   if gTorrents.Items.Count = 0 then exit;
   gTorrents.Tag:=1;
@@ -6496,22 +6120,93 @@ begin
   finally
     gTorrents.Tag:=0;
   end;
-  args:=TJSONObject.Create;
-  if RemoveLocalData then
-    args.Add('delete-local-data', TJSONIntegerNumber.Create(1));
 
-  if TorrentAction(ids, 'torrent-remove', args) then begin
+  // 把 variant 转成动态数组传给 context
+  SetLength(idArr, gTorrents.SelCount);
+  if VarIsArray(ids) then
+    for i:=0 to gTorrents.SelCount - 1 do
+      idArr[i]:=ids[i]
+  else
+    idArr[0]:=ids;
+
+  QueueRemoveTorrent(idArr, RemoveLocalData);
+end;
+
+procedure TMainForm.QueueRemoveTorrent(const Ids: array of integer; RemoveLocalData: boolean);
+var
+  req, args: TJSONObject;
+  _ids: TJSONArray;
+  i: integer;
+  request: TRpcUserRequest;
+  ctx: TRemoveTorrentContext;
+begin
+  AppBusy;
+  ctx:=TRemoveTorrentContext.Create;
+  SetLength(ctx.Ids, Length(Ids));
+  for i:=0 to High(Ids) do
+    ctx.Ids[i]:=Ids[i];
+  ctx.RemoveLocalData:=RemoveLocalData;
+
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-remove');
+    args:=TJSONObject.Create;
+    if RemoveLocalData then
+      args.Add('delete-local-data', TJSONIntegerNumber.Create(1));
+    _ids:=TJSONArray.Create;
+    for i:=0 to High(Ids) do
+      _ids.Add(Ids[i]);
+    args.Add('ids', _ids);
+    req.Add('arguments', args);
+
+    request:=TRpcUserRequest.Create(req, False, 30000, @RemoveTorrentCompleted, FRequestLifetime);
+    request.Context:=ctx;
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      ctx.Free;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      exit;
+    end;
+    req:=nil;
+    ctx:=nil;
+  finally
+    req.Free;
+    ctx.Free;
+  end;
+end;
+
+procedure TMainForm.RemoveTorrentCompleted(ARequest: TObject);
+var
+  ctx: TRemoveTorrentContext;
+  i, j, id: integer;
+  found: boolean;
+begin
+  AppNormal;
+  UpdateUI;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  ctx:=TRemoveTorrentContext(TRpcUserRequest(ARequest).Context);
+  try
+    if TRpcUserRequest(ARequest).Result = nil then begin
+      CheckStatus(False);
+      exit;
+    end;
+
+    // 本地标记为已删除
     with gTorrents do begin
       BeginUpdate;
       try
         i:=0;
         while i < Items.Count do begin
           id:=Items[idxTorrentId, i];
-          for j:=0 to VarArrayHighBound(ids, 1) do
-            if id = ids[j] then begin
-              Items.Items[idxDeleted, i]:=1;
+          found:=False;
+          for j:=0 to High(ctx.Ids) do
+            if id = ctx.Ids[j] then begin
+              found:=True;
               break;
             end;
+          if found then
+            Items.Items[idxDeleted, i]:=1;
           Inc(i);
         end;
       finally
@@ -6519,8 +6214,12 @@ begin
       end;
     end;
 
-    if RemoveLocalData then
-      RpcObj.QueueRefresh([rtSession]);
+    if ctx.RemoveLocalData then
+      RpcObj.QueueRefresh([rtSession])
+    else
+      DoRefresh(True);
+  finally
+    ctx.Free;
   end;
 end;
 
@@ -7142,7 +6841,9 @@ function TMainForm.SetFilePriority(TorrentId: integer; const Files: array of int
 
 var
   req, args: TJSONObject;
+  request: TRpcUserRequest;
 begin
+  Result:=False;
   AppBusy;
   req:=TJSONObject.Create;
   try
@@ -7157,17 +6858,28 @@ begin
       args.Add('priority-' + APriority, CreateFilesArray);
     end;
     req.Add('arguments', args);
-    args:=RpcObj.SendRequest(req, False);
-    Result:=args<> nil;
-    args.Free;
+    request:=TRpcUserRequest.Create(req, False, -1, @FilePriorityCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      exit;
+    end;
+    req:=nil;
+    Result:=True;
   finally
     req.Free;
   end;
-  if not Result then
+end;
+
+procedure TMainForm.FilePriorityCompleted(ARequest: TObject);
+begin
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then
     CheckStatus(False)
   else
     DoRefresh;
-  AppNormal;
 end;
 
 function TMainForm.SetCurrentFilePriority(const APriority: string): boolean;
@@ -7231,7 +6943,7 @@ begin
   if gTorrents.Items.Count = 0 then exit;
   args:=TJSONObject.Create;
   args.Add('bandwidthPriority', TJSONIntegerNumber.Create(APriority));
-  TorrentAction(GetSelectedTorrents, 'torrent-set', args);
+  QueueTorrentAction(GetSelectedTorrents, 'torrent-set', args);
 end;
 
 procedure TMainForm.ProcessPieces(const Pieces: string; PieceCount: integer; const Done: double);
@@ -7700,46 +7412,21 @@ end;
 
 procedure TMainForm.AddTracker(EditMode: boolean);
 var
-  req, args: TJSONObject;
-  id, torid: integer;
+  id: integer;
 begin
-  AppBusy;
   with TAddTrackerForm.Create(Self) do
   try
     id:=0;
-    torid:=RpcObj.CurTorrentId;
+    TorrentId:=RpcObj.CurTorrentId;
     if EditMode then begin
       Caption:=STrackerProps;
       edTracker.Text:=UTF8Encode(widestring(lvTrackers.Items[idxTrackersListName, lvTrackers.Row]));
       id:=lvTrackers.Items[idxTrackerID, lvTrackers.Row];
+      TrackerId:=id;
+      EditMode:=True;
     end;
-    AppNormal;
-    if ShowModal = mrOk then begin
-      AppBusy;
-      Self.Update;
-      req:=TJSONObject.Create;
-      try
-        req.Add('method', 'torrent-set');
-        args:=TJSONObject.Create;
-        args.Add('ids', TJSONArray.Create([torid]));
-        if EditMode then
-          args.Add('trackerReplace', TJSONArray.Create([id, UTF8Encode(edTracker.Text)]))  //fix bag
-        else
-          args.Add('trackerAdd', TJSONArray.Create([UTF8Encode(edTracker.Text)])); //fix bag
-        req.Add('arguments', args);
-        args:=nil;
-        args:=RpcObj.SendRequest(req, False);
-        if args = nil then begin
-          CheckStatus(False);
-          exit;
-        end;
-        args.Free;
-      finally
-        req.Free;
-      end;
+    if ShowModal = mrOk then
       DoRefresh;
-      AppNormal;
-    end;
   finally
     Free;
   end;
@@ -7810,6 +7497,7 @@ end;
 procedure TMainForm.SetSpeedLimit(const Dir: string; Speed: integer);
 var
   req, args: TJSONObject;
+  request: TRpcUserRequest;
 begin
   AppBusy;
   req:=TJSONObject.Create;
@@ -7821,17 +7509,28 @@ begin
       args.Add(Format('speed-limit-%s', [Dir]), Speed);
     args.Add('alt-speed-enabled', 0);
     req.Add('arguments', args);
-    args:=RpcObj.SendRequest(req, False);
-    if args = nil then begin
-      CheckStatus(False);
+    request:=TRpcUserRequest.Create(req, False, -1, @SpeedLimitCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
       exit;
     end;
-    args.Free;
+    req:=nil;
   finally
     req.Free;
   end;
-  RpcObj.QueueRefresh([rtSession]);
+end;
+
+procedure TMainForm.SpeedLimitCompleted(ARequest: TObject);
+begin
   AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  if TRpcUserRequest(ARequest).Result = nil then begin
+    CheckStatus(False);
+    exit;
+  end;
+  RpcObj.QueueRefresh([rtSession]);
 end;
 
 function TMainForm.FixSeparators(const p: string): string;
@@ -8030,16 +7729,106 @@ begin
 end;
 
 function TMainForm.RenameTorrent(TorrentId: integer; const OldPath, NewName: string): boolean;
-var
-  args: TJSONObject;
 begin
-  Result:=False;
-  if ExtractFileName(OldPath) = NewName then
+  // 保留旧函数签名，但内部改为异步提交；返回值恒为 True（调用方不再依赖返回值）
+  if ExtractFileName(OldPath) = NewName then begin
+    Result:=False;
     exit;
-  args:=TJSONObject.Create;
-  args.Add('path', UTF8Decode(OldPath));
-  args.Add('name', UTF8Decode(NewName));
-  Result:=TorrentAction(TorrentId, 'torrent-rename-path', args);
+  end;
+  Result:=True;
+end;
+
+procedure TMainForm.QueueRenameTorrent(AMode: integer; TorrentId: integer; const OldPath, NewName: string; ARow: integer);
+var
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+  ctx: TRenameTorrentContext;
+begin
+  AppBusy;
+  ctx:=TRenameTorrentContext.Create;
+  ctx.Mode:=AMode;
+  ctx.TorrentId:=TorrentId;
+  ctx.OldPath:=OldPath;
+  ctx.NewName:=NewName;
+  ctx.Row:=ARow;
+
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-rename-path');
+    args:=TJSONObject.Create;
+    args.Add('path', UTF8Decode(OldPath));
+    args.Add('name', UTF8Decode(NewName));
+    args.Add('ids', TJSONArray.Create([TorrentId]));
+    req.Add('arguments', args);
+
+    request:=TRpcUserRequest.Create(req, False, -1, @RenameTorrentCompleted, FRequestLifetime);
+    request.Context:=ctx;
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      ctx.Free;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      exit;
+    end;
+    req:=nil;
+    ctx:=nil;
+  finally
+    req.Free;
+    ctx.Free;
+  end;
+end;
+
+procedure TMainForm.RenameTorrentCompleted(ARequest: TObject);
+var
+  ctx: TRenameTorrentContext;
+  p: string;
+  i, lvl, len: integer;
+begin
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  ctx:=TRenameTorrentContext(TRpcUserRequest(ARequest).Context);
+  try
+    if TRpcUserRequest(ARequest).Result = nil then begin
+      CheckStatus(False);
+      exit;
+    end;
+
+    case ctx.Mode of
+      RM_TORRENT_NAME:
+        begin
+          // 更新任务列表中的名称
+          gTorrents.Items[idxName, ctx.Row]:=UTF8Decode(ctx.NewName);
+          FFilesTree.Clear;
+        end;
+      RM_FILE_NAME:
+        begin
+          // 更新文件列表中的名称
+          FFiles[idxFileName, ctx.Row]:=UTF8Decode(ctx.NewName);
+          if FFilesTree.IsFolder(ctx.Row) then begin
+            // 更新子元素路径
+            p:=ctx.OldPath;
+            len:=Length(p);
+            p:=ExtractFilePath(p) + ctx.NewName;
+            lvl:=FFilesTree.RowLevel[ctx.Row];
+            FFiles.BeginUpdate;
+            try
+              FFiles[idxFileFullPath, ctx.Row]:=UTF8Decode(p + RemotePathDelimiter);
+              for i:=ctx.Row + 1 to FFiles.Count - 1 do
+                if FFilesTree.RowLevel[i] > lvl then
+                  FFiles[idxFileFullPath, i]:=UTF8Decode(p + Copy(UTF8Encode(widestring(FFiles[idxFileFullPath, i])), len + 1, MaxInt))
+                else
+                  break;
+            finally
+              FFiles.EndUpdate;
+            end;
+          end;
+        end;
+    end;
+
+    DoRefresh(True);
+  finally
+    ctx.Free;
+  end;
 end;
 
 procedure TMainForm.FilesTreeStateChanged(Sender: TObject);
@@ -8076,49 +7865,93 @@ begin
   end;
 end;
 
-procedure TMainForm.OpenCurrentTorrent(OpenFolderOnly: boolean; UserDef: boolean);
+procedure TMainForm.QueueOpenTorrent(OpenFolderOnly: boolean; UserDef: boolean);
+var
+  req, args: TJSONObject;
+  _fields: TJSONArray;
+  request: TRpcUserRequest;
+  ctx: TOpenTorrentContext;
+begin
+  if gTorrents.Items.Count = 0 then
+    exit;
+  AppBusy;
+  gTorrents.RemoveSelection;
+
+  ctx:=TOpenTorrentContext.Create;
+  ctx.OpenFolderOnly:=OpenFolderOnly;
+  ctx.UserDef:=UserDef;
+  ctx.TorrentId:=gTorrents.Items[idxTorrentId, gTorrents.Row];
+  ctx.Row:=gTorrents.Row;
+
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-get');
+    args:=TJSONObject.Create;
+    args.Add('ids', TJSONArray.Create([ctx.TorrentId]));
+    _fields:=TJSONArray.Create(['files', 'downloadDir']);
+    args.Add('fields', _fields);
+    req.Add('arguments', args);
+
+    request:=TRpcUserRequest.Create(req, True, -1, @OpenTorrentCompleted, FRequestLifetime);
+    request.Context:=ctx;
+    if not RpcObj.QueueUserRequest(request) then begin
+      AppNormal;
+      ctx.Free;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      exit;
+    end;
+    req:=nil;
+    ctx:=nil;  // request 持有并释放
+  finally
+    req.Free;
+    ctx.Free;
+  end;
+end;
+
+procedure TMainForm.OpenTorrentCompleted(ARequest: TObject);
 var
   res: TJSONObject;
+  ctx: TOpenTorrentContext;
   p, s: string;
   sel: boolean;
   files: TJSONArray;
 begin
-  if gTorrents.Items.Count = 0 then
+  AppNormal;
+  if TRpcUserRequest(ARequest).Cancelled then
     exit;
-  Application.ProcessMessages;
-  AppBusy;
-  try
-    sel:=False;
-    gTorrents.RemoveSelection;
-    res:=RpcObj.RequestInfo(gTorrents.Items[idxTorrentId, gTorrents.Row], ['files', 'downloadDir']);
-    if res = nil then
-      CheckStatus(False)
-    else
-      try
-        with res.Arrays['torrents'].Objects[0] do begin
-          files:=Arrays['files'];
-          if files.Count = 0 then exit;
-          if files.Count = 1 then begin
-            p:=UTF8Encode((files[0] as TJSONObject).Strings['name']);
-            sel:=OpenFolderOnly;
-          end
-          else begin
-            //sel:=OpenFolderOnly; // bag? missed?
-            s:=GetFilesCommonPath(files);
-            repeat
-              p:=s;
-              s:=ExtractFilePath(p);
-            until (s = '') or (s = p);
-          end;
-          p:=IncludeTrailingPathDelimiter(UTF8Encode(Strings['downloadDir'])) + p;
-        end;
-      finally
-        res.Free;
-      end;
-    ExecRemoteFile(p, sel, Userdef);
-  finally
-    AppNormal;
+  ctx:=TOpenTorrentContext(TRpcUserRequest(ARequest).Context);
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then begin
+    CheckStatus(False);
+    exit;
   end;
+  try
+    with res.Arrays['torrents'].Objects[0] do begin
+      files:=Arrays['files'];
+      if files.Count = 0 then exit;
+      sel:=False;
+      if files.Count = 1 then begin
+        p:=UTF8Encode((files[0] as TJSONObject).Strings['name']);
+        sel:=ctx.OpenFolderOnly;
+      end
+      else begin
+        s:=GetFilesCommonPath(files);
+        repeat
+          p:=s;
+          s:=ExtractFilePath(p);
+        until (s = '') or (s = p);
+      end;
+      p:=IncludeTrailingPathDelimiter(UTF8Encode(Strings['downloadDir'])) + p;
+    end;
+    ExecRemoteFile(p, sel, ctx.UserDef);
+  finally
+    ctx.Free;
+  end;
+end;
+
+procedure TMainForm.OpenCurrentTorrent(OpenFolderOnly: boolean; UserDef: boolean);
+begin
+  QueueOpenTorrent(OpenFolderOnly, UserDef);
 end;
 
 procedure myDumpAddr(Addr: Pointer;var f:system.text);
@@ -8142,6 +7975,25 @@ begin
   for FrameNumber := 0 to FrameCount-1 do
     myDumpAddr(Frames[FrameNumber],f);
 end;
+
+procedure DebugLog(const Msg: string);
+var
+  f: System.Text;
+  fn: string;
+begin
+  fn:='debug.log';
+  System.Assign(f, fn);
+  if FileExists(fn) then
+    System.Append(f)
+  else
+    System.Rewrite(f);
+  try
+    WriteLn(f, FormatDateTime('hh:nn:ss.zzz', Now) + ' ' + Msg);
+  finally
+    System.Close(f);
+  end;
+end;
+
 procedure TMainForm._onException(Sender: TObject; E: Exception);
 var
   f:system.text;
@@ -8154,7 +8006,12 @@ begin
     else
         system.Rewrite(f);
 
-    WriteLn(f,'');WriteLn(f,'v.' + AppVersion + ' crashed((');WriteLn(f,'');
+    WriteLn(f,'============================================================');
+    WriteLn(f,'v.' + AppVersion + ' crashed((');
+    WriteLn(f,FormatDateTime('yyyy-mm-dd hh:nn:ss', Now));
+    if E <> nil then
+      WriteLn(f,'Exception: ' + E.ClassName + ' - ' + E.Message);
+    WriteLn(f,'');
     myDumpExceptionBackTrace(f);
     system.close(f);
     halt(0);

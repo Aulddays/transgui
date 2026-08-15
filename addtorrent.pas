@@ -26,7 +26,7 @@ interface
 uses
   Classes, SysUtils, FileUtil, LResources, Forms, Controls, Graphics, Dialogs,
   StdCtrls, Spin, VarGrid, Grids, ButtonPanel, ExtCtrls, Buttons, BaseForm,
-  varlist, fpjson, StrUtils, DateUtils, LazUTF8;
+  varlist, fpjson, StrUtils, DateUtils, LazUTF8, rpc;
 
 resourcestring
   SSize = 'Size';
@@ -68,6 +68,7 @@ type
     procedure DiskSpaceTimerTimer(Sender: TObject);
     procedure edSaveAsChange(Sender: TObject);
     procedure FormCreate(Sender: TObject);
+    procedure FormDestroy(Sender: TObject);
     procedure FormShow(Sender: TObject);
     procedure OKButtonClick(Sender: TObject);
     procedure SearchGoodExtension ();
@@ -79,8 +80,10 @@ type
   private
     FDiskSpaceCaption: string;
     FTree: TFilesTree;
+    FRequestLifetime: TRpcRequestLifetime;
     procedure TreeStateChanged(Sender: TObject);
     procedure UpdateSize;
+    procedure FreeSpaceCompleted(ARequest: TObject);
   public
     OrigCaption: string;
     Extension : string;
@@ -169,7 +172,7 @@ const
 
 implementation
 
-uses lclintf, lcltype, main, variants, Utils, rpc, lclproc;
+uses lclintf, lcltype, main, variants, Utils, lclproc;
 
 const
   roChecked   = $030000;
@@ -1050,34 +1053,30 @@ end;
 
 procedure TAddTorrentForm.DiskSpaceTimerTimer(Sender: TObject);
 var
-  f: double;
   req, args: TJSONObject;
+  request: TRpcUserRequest;
 begin
   DiskSpaceTimer.Enabled:=False;
   if RpcObj.RPCVersion < 15 then
     exit;
-  AppBusy;
-  f:=-1;
+  req:=TJSONObject.Create;
   try
-    req:=TJSONObject.Create;
+    req.Add('method', 'free-space');
     args:=TJSONObject.Create;
-    try
-      req.Add('method', 'free-space');
-      args.Add('path', UTF8Decode(cbDestFolder.Text));
-      req.Add('arguments', args);
-      args:=RpcObj.SendRequest(req);
-      if args <> nil then
-        f:=args.Floats['size-bytes'];
-      RpcObj.Status:='';
-    finally
-      args.Free;
-      req.Free;
+    args.Add('path', UTF8Decode(cbDestFolder.Text));
+    req.Add('arguments', args);
+
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, True, -1, @FreeSpaceCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(-1);
+      exit;
     end;
-  except
-    f:=-1;
+    req:=nil;
+  finally
+    req.Free;
   end;
-  txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(f);
-  AppNormal;
 end;
 
 procedure TAddTorrentForm.edSaveAsChange(Sender: TObject);
@@ -1238,6 +1237,7 @@ end;
 
 procedure TAddTorrentForm.FormCreate(Sender: TObject);
 begin
+  FRequestLifetime:=TRpcRequestLifetime.Create;
   OrigCaption:=Caption;
   FDiskSpaceCaption:=txDiskSpace.Caption;
   lvFiles.Items.ExtraColumns:=FilesExtraColumns;
@@ -1262,6 +1262,27 @@ begin
 {$ifdef darwin}
   Buttons.BorderSpacing.Right:=Buttons.BorderSpacing.Right + ScaleInt(12);
 {$endif darwin}
+end;
+
+procedure TAddTorrentForm.FormDestroy(Sender: TObject);
+begin
+  FRequestLifetime.Active:=False;
+  FRequestLifetime.Release;
+end;
+
+procedure TAddTorrentForm.FreeSpaceCompleted(ARequest: TObject);
+var
+  f: double;
+  res: TJSONObject;
+begin
+  if TRpcUserRequest(ARequest).Cancelled then
+    exit;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res <> nil then
+    f:=res.Floats['size-bytes']
+  else
+    f:=-1;
+  txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(f);
 end;
 
 initialization
