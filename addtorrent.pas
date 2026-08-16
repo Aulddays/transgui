@@ -26,7 +26,7 @@ interface
 uses
   Classes, SysUtils, FileUtil, LResources, Forms, Controls, Graphics, Dialogs,
   StdCtrls, Spin, VarGrid, Grids, ButtonPanel, ExtCtrls, Buttons, BaseForm,
-  varlist, fpjson, StrUtils, DateUtils, LazUTF8, rpc;
+  varlist, fpjson, StrUtils, DateUtils, LazUTF8, rpc, bencode;
 
 resourcestring
   SSize = 'Size';
@@ -34,6 +34,8 @@ resourcestring
   SInvalidName = 'Invalid name specified.';
 
 type
+  TPostAddFilterKind = (pafNone, pafPath, pafTracker);
+
   TFilesTree = class;
 
   { TAddTorrentForm }
@@ -81,13 +83,57 @@ type
     FDiskSpaceCaption: string;
     FTree: TFilesTree;
     FRequestLifetime: TRpcRequestLifetime;
+    // ---- 异步添加流程状态 ----
+    FFileName: Utf8String;       // 原始文件名或URL
+    FTorrentData: string;        // base64 编码的 torrent 数据，或 '-' 表示 URL/magnet
+    FTorrentId: integer;         // 当前添加的 torrent id
+    FOldName: string;            // 原始名称（用于重命名判断）
+    FOldDownloadDir: string;     // 原始下载目录（用于目录变更判断）
+    FIniSec: string;             // Ini section: 'AddTorrent.' + FCurConn
+    FPostAddFilterKind: TPostAddFilterKind;
+    FIsAppHidden: boolean;
+    FWaitForm: TBaseForm;
+    FStep: integer;              // 当前步骤（调试/状态追踪用）
+    FAddTrackersTorrentId: integer; // _AddTrackers 子流程用
+    FAddTrackersHash: string;    // _AddTrackers 子流程用 hash
+    FAddTrackersList: TStringList; // _AddTrackers 子流程用 tracker 列表
+    FOKClicked: boolean;         // 用户是否点了OK
+    FInitialized: boolean;       // FormShow 是否已初始化（防止重复触发）
+    FInitError: string;          // 初始化错误信息
     procedure TreeStateChanged(Sender: TObject);
     procedure UpdateSize;
     procedure FreeSpaceCompleted(ARequest: TObject);
+    procedure EnableControls(AEnabled: Boolean);
+    // ---- 异步流程回调 ----
+    procedure AsyncFinish(ASuccess: boolean);
+    procedure ShowWaitMsg(const AText: string);
+    procedure HideWaitMsg;
+    procedure StepSessionGet;
+    procedure SessionGetCompleted(ARequest: TObject);
+    procedure StepTorrentAdd;
+    procedure TorrentAddCompleted(ARequest: TObject);
+    procedure StepTorrentGetInfo;
+    procedure TorrentGetInfoCompleted(ARequest: TObject);
+    procedure StepOKAfterModal;
+    procedure StepTorrentSet;
+    procedure TorrentSetCompleted(ARequest: TObject);
+    procedure StepTorrentRename;
+    procedure TorrentRenameCompleted(ARequest: TObject);
+    procedure StepTorrentStart;
+    procedure TorrentStartCompleted(ARequest: TObject);
+    // ---- _AddTrackers 子流程 ----
+    procedure BeginAddTrackers(TorrentId: integer);
+    procedure AddTrackersConfirmYes;
+    procedure AddTrackersGetCompleted(ARequest: TObject);
+    procedure AddTrackersSetCompleted(ARequest: TObject);
+    procedure AddTrackersFinish;
   public
     OrigCaption: string;
     Extension : string;
     property FilesTree: TFilesTree read FTree;
+    property ResultTorrentId: integer read FTorrentId;
+    property ResultFilterKind: TPostAddFilterKind read FPostAddFilterKind;
+    procedure Execute(const AFileName: Utf8String); // 入口（内部 ShowModal）
   end;
 
   TFolderInfo = record
@@ -172,7 +218,8 @@ const
 
 implementation
 
-uses lclintf, lcltype, main, variants, Utils, lclproc;
+uses lclintf, lcltype, main, variants, Utils, lclproc,
+  synacode, synautil, LazFileUtils, ResTranslator, download;
 
 const
   roChecked   = $030000;
@@ -845,25 +892,34 @@ end;
 
 procedure TAddTorrentForm.FormShow(Sender: TObject);
 begin
-  AppBusy;
-  lvFiles.BeginUpdate;
-  try
-    btSelectAllClick(nil);
-{
-    lvFiles.Sort;
-    if lvFiles.Items.Count > 0 then
-      lvFiles.Row:=0;
-}
-//    FTree.CollapseAll;
-  finally
-    lvFiles.EndUpdate;
+  if FInitialized then exit;
+  FInitialized:=True;
+
+  // 初始化失败，直接关闭
+  if FInitError <> '' then begin
+    MessageDlg(FInitError, mtError, [mbOK], 0);
+    ModalResult:=mrCancel;
+    exit;
   end;
 
-  // Search good extension
-  SearchGoodExtension ();
+  // 启动异步流程：第一步 session-get
+  EnableControls(False);
+  StepSessionGet;
+end;
 
-  DiskSpaceTimerTimer(nil);
-  AppNormal;
+procedure TAddTorrentForm.EnableControls(AEnabled: Boolean);
+var
+  i: integer;
+begin
+  for i:=0 to ComponentCount - 1 do
+    if Components[i] is TWinControl then
+      TWinControl(Components[i]).Enabled:=AEnabled;
+  Buttons.CancelButton.Enabled:=True; // Cancel 始终可用
+  Buttons.OKButton.Enabled:=AEnabled;
+  if AEnabled then
+    AppNormal
+  else
+    AppBusy;
 end;
 
 function TAddTorrentForm.CorrectPath (path: string): string;
@@ -960,7 +1016,10 @@ begin
       exit;
     end;
   end;
-  ModalResult:=mrOK;
+
+  // 异步化：不再直接关闭，而是启动后续 RPC 流程
+  Buttons.OKButton.Enabled:=False;
+  StepOKAfterModal;
 end;
 
 procedure TAddTorrentForm.UpdateSize;
@@ -1268,6 +1327,10 @@ procedure TAddTorrentForm.FormDestroy(Sender: TObject);
 begin
   FRequestLifetime.Active:=False;
   FRequestLifetime.Release;
+  if FAddTrackersList <> nil then
+    FAddTrackersList.Free;
+  if FWaitForm <> nil then
+    FWaitForm.Free;
 end;
 
 procedure TAddTorrentForm.FreeSpaceCompleted(ARequest: TObject);
@@ -1283,6 +1346,853 @@ begin
   else
     f:=-1;
   txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(f);
+end;
+
+{ ============================================================================
+  异步添加种子流程
+  ============================================================================ }
+
+procedure TAddTorrentForm.ShowWaitMsg(const AText: string);
+begin
+  if FWaitForm = nil then begin
+    FWaitForm:=TBaseForm.CreateNew(Self);
+    with FWaitForm do begin
+{$ifndef windows}
+      if FIsAppHidden then
+        ShowInTaskBar:=stAlways;
+{$endif windows}
+      Caption:=AppName;
+      BorderStyle:=bsToolWindow;
+      BorderIcons:=[];
+      Position:=poScreenCenter;
+      Constraints.MinWidth:=400;
+      AutoSize:=True;
+      BorderWidth:=ScaleInt(16);
+      with TLabel.Create(FWaitForm) do begin
+        Alignment:=taCenter;
+        Align:=alClient;
+        Parent:=FWaitForm;
+      end;
+    end;
+  end;
+  with FWaitForm do begin
+    TLabel(Controls[0]).Caption:=AText + '...';
+    Show;
+    BringToFront;
+{$ifdef lclgtk2}
+    Application.ProcessMessages;
+{$endif lclgtk2}
+    Update;
+{$ifdef lclgtk2}
+    sleep(100);
+    Application.ProcessMessages;
+{$endif lclgtk2}
+  end;
+end;
+
+procedure TAddTorrentForm.HideWaitMsg;
+begin
+  if FWaitForm <> nil then
+    FreeAndNil(FWaitForm);
+end;
+
+procedure TAddTorrentForm.AsyncFinish(ASuccess: boolean);
+begin
+  HideWaitMsg;
+  AppNormal;
+  FRequestLifetime.Active:=False;
+
+  // 如果失败，把 FTorrentId 保留（MainForm 用来清理）
+  // 如果成功，FTorrentId 也保留（MainForm 用来 post-add filter）
+  // 都通过 public 属性 ResultTorrentId / ResultFilterKind 暴露
+
+  // 关闭模态对话框
+  if ASuccess then
+    ModalResult:=mrOk
+  else
+    ModalResult:=mrCancel;
+end;
+
+procedure TAddTorrentForm.Execute(const AFileName: Utf8String);
+var
+  fs: TFileStreamUTF8;
+  i: integer;
+begin
+  FFileName:=AFileName;
+  FTorrentId:=0;
+  FStep:=0;
+  FPostAddFilterKind:=pafNone;
+  FOKClicked:=False;
+  FAddTrackersList:=nil;
+  FIsAppHidden:=not MainForm.Visible or (MainForm.WindowState = wsMinimized);
+
+  if FIsAppHidden then begin
+    ShowWaitMsg(Caption);
+{$ifndef windows}
+    ShowInTaskBar:=stAlways;
+{$endif windows}
+  end;
+
+  // 读取 torrent 文件或标记为 URL
+  if IsProtocolSupported(FFileName) then
+    FTorrentData:='-'
+  else begin
+    try
+      fs:=TFileStreamUTF8.Create(FFileName, fmOpenRead or fmShareDenyNone);
+    except
+      on E: Exception do begin
+        HideWaitMsg;
+        FInitError:=E.Message;
+        ModalResult:=mrCancel;
+        exit;
+      end;
+    end;
+    try
+      SetLength(FTorrentData, fs.Size);
+      fs.ReadBuffer(PChar(FTorrentData)^, Length(FTorrentData));
+    finally
+      fs.Free;
+    end;
+    FTorrentData:=EncodeBase64(FTorrentData);
+  end;
+
+  // 准备 Ini section 和目录列表
+  FIniSec:='AddTorrent.' + MainForm.CurConn;
+  MainForm.FillDownloadDirs(cbDestFolder, 'LastDownloadDir');
+  if MainForm.WatchDownloading and (MainForm.WatchDestinationFolder <> '') then
+    cbDestFolder.Text:=MainForm.WatchDestinationFolder;
+
+  // 记录 post-add filter 信息
+  if MainForm.lvFilter.Row >= StatusFiltersCount then begin
+    i:=MainForm.lvFilter.Row;
+    if VarIsNull(MainForm.lvFilter.Items[0, i]) then
+      Dec(i);
+    if i >= StatusFiltersCount then
+      if not VarIsNull(MainForm.lvFilter.Items[-1, i]) then
+        FPostAddFilterKind:=pafPath
+      else
+        FPostAddFilterKind:=pafTracker;
+  end;
+  MainForm.lvFilter.Row:=0;
+  MainForm.edSearch.Text:='';
+
+  // 显示模态对话框，FormShow 里启动异步流程
+  ShowModal;
+end;
+
+procedure TAddTorrentForm.StepSessionGet;
+var
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+begin
+  FStep:=1;
+  AppBusy;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'session-get');
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, True, -1, @SessionGetCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      AsyncFinish(False);
+      exit;
+    end;
+    req:=nil;
+  finally
+    req.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.SessionGetCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+  s: string;
+  i: integer;
+  pFD: FolderData;
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AsyncFinish(False);
+    exit;
+  end;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then begin
+    MainForm.CheckStatus(False);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  // 填默认目录到下拉框
+  s:=CorrectPath(UTF8Encode(res.Strings['download-dir']));
+  try
+    if cbDestFolder.Items.IndexOf(s) < 0 then begin
+      pFD:=FolderData.Create;
+      pFD.Hit:=1;
+      pFD.Ext:='';
+      pFD.Txt:=s;
+      pFD.Lst:=SysUtils.Date;
+      cbDestFolder.Items.Add(s);
+      i:=cbDestFolder.Items.IndexOf(s);
+      cbDestFolder.Items.Objects[i]:=pFD;
+    end;
+  except
+    MessageDlg('Error: LS-005. Please contact the developer', mtError, [mbOK], 0);
+  end;
+
+  // 旧版本显示磁盘空间
+  if RpcObj.RPCVersion < 15 then
+    if res.IndexOfName('download-dir-free-space') >= 0 then
+      txDiskSpace.Caption:=txDiskSpace.Caption + ' ' + GetHumanSize(res.Floats['download-dir-free-space'])
+    else begin
+      txDiskSpace.Hide;
+      txSize.Top:=(txSize.Top + txDiskSpace.Top) div 2;
+    end;
+
+  // 下一步：torrent-add
+  StepTorrentAdd;
+end;
+
+procedure TAddTorrentForm.StepTorrentAdd;
+var
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+  i: integer;
+  ss: string;
+begin
+  FStep:=2;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-add');
+    args:=TJSONObject.Create;
+    args.Add('paused', TJSONIntegerNumber.Create(1));
+    i:=Ini.ReadInteger(FIniSec, 'PeerLimit', 0);
+    if i <> 0 then
+      args.Add('peer-limit', TJSONIntegerNumber.Create(i));
+
+    // 处理空目录
+    try
+      ss:=cbDestFolder.Text;
+      if ss = '' then begin
+        if cbDestFolder.Items.Count = 0 then
+          ss:='' // 后面会有 session-get 给默认值，但这里先空着
+        else begin
+          cbDestFolder.ItemIndex:=0;
+          ss:=cbDestFolder.Text;
+        end;
+      end;
+    except
+      MessageDlg('Error: LS-006. Please contact the developer', mtError, [mbOK], 0);
+      ss:='';
+    end;
+    args.Add('download-dir', TJSONString.Create(UTF8Decode(ss)));
+
+    if FTorrentData = '-' then
+      args.Add('filename', TJSONString.Create(FFileName))
+    else
+      args.Add('metainfo', TJSONString.Create(FTorrentData));
+    req.Add('arguments', args);
+
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, True, -1, @TorrentAddCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      AsyncFinish(False);
+      exit;
+    end;
+    req:=nil;
+  finally
+    req.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.TorrentAddCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AsyncFinish(False);
+    exit;
+  end;
+  res:=TRpcUserRequest(ARequest).Result;
+
+  // 处理重复种子
+  if res <> nil then begin
+    if res.IndexOfName('torrent-duplicate') >= 0 then begin
+      BeginAddTrackers(res.Objects['torrent-duplicate'].Integers['id']);
+      exit;
+    end;
+    FTorrentId:=res.Objects['torrent-added'].Integers['id'];
+  end
+  else begin
+    if RpcObj.Status = 'duplicate torrent' then begin
+      BeginAddTrackers(0);
+      exit;
+    end;
+    MainForm.CheckStatus(False);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  if FTorrentId = 0 then begin
+    MainForm.CheckStatus(False);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  // 如果是"目录变更后重新添加"的分支（FOldDownloadDir 有值且已经过一轮 ShowModal），
+  // 直接跳转到 StepTorrentSet
+  if FOKClicked then begin
+    MainForm.DoRefresh(True);
+    StepTorrentSet;
+    exit;
+  end;
+
+  // 正常流程：刷新 + 获取文件信息
+  MainForm.DoRefresh(True);
+  StepTorrentGetInfo;
+end;
+
+procedure TAddTorrentForm.StepTorrentGetInfo;
+var
+  req, args: TJSONObject;
+  _fields: TJSONArray;
+  request: TRpcUserRequest;
+begin
+  FStep:=3;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-get');
+    args:=TJSONObject.Create;
+    args.Add('ids', TJSONArray.Create([FTorrentId]));
+    _fields:=TJSONArray.Create(['files','maxConnectedPeers','name','metadataPercentComplete']);
+    args.Add('fields', _fields);
+    req.Add('arguments', args);
+
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, True, -1, @TorrentGetInfoCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      AsyncFinish(False);
+      exit;
+    end;
+    req:=nil;
+  finally
+    req.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.TorrentGetInfoCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+  t: TJSONArray;
+  ShowWindow: boolean;
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AsyncFinish(False);
+    exit;
+  end;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then begin
+    MainForm.CheckStatus(False);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  t:=res.Arrays['torrents'];
+  if t.Count = 0 then begin
+    MessageDlg(sUnableGetFilesList, mtError, [mbOK], 0);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  // 填充 UI
+  FOldName:=UTF8Encode(t.Objects[0].Strings['name']);
+  edSaveAs.Text:=FOldName;
+  edSaveAs.Text:=ExcludeInvalidChar(edSaveAs.Text);
+
+  if RpcObj.RPCVersion < 15 then begin
+    edSaveAs.Enabled:=False;
+    edSaveAs.ParentColor:=True;
+  end;
+  edPeerLimit.Value:=t.Objects[0].Integers['maxConnectedPeers'];
+  FilesTree.FillTree(FTorrentId, t.Objects[0].Arrays['files'], nil, nil);
+
+  Width:=Ini.ReadInteger('AddTorrent', 'Width', Width);
+  if (RpcObj.RPCVersion >= 7) and (lvFiles.Items.Count = 0) and (t.Objects[0].Floats['metadataPercentComplete'] <> 1.0) then begin
+    // Magnet link
+    gbContents.Hide;
+    gbSaveAs.BorderSpacing.Bottom:=gbSaveAs.BorderSpacing.Top;
+    BorderStyle:=bsDialog;
+    AutoSizeForm(TCustomForm(gbContents.Parent));
+    edSaveAs.Enabled:=False;
+    edSaveAs.ParentColor:=True;
+  end
+  else
+    // Torrent file
+    Height:=Ini.ReadInteger('AddTorrent', 'Height', Height);
+
+  FOldDownloadDir:=cbDestFolder.Text;
+
+  // 全选文件 + 搜索扩展名 + 启动磁盘空间查询
+  btSelectAllClick(nil);
+  SearchGoodExtension;
+  DiskSpaceTimerTimer(nil);
+
+  EnableControls(True);
+  HideWaitMsg;
+
+  // 判断是否自动跳过对话框直接添加
+  ShowWindow:=Ini.ReadBool('Interface', 'ShowAddTorrentWindow', True);
+  if MainForm.WatchDownloading then
+    ShowWindow:=False;
+  if not ShowWindow then begin
+    // 不显示对话框，直接走 OK 流程
+    FOKClicked:=True;
+    StepOKAfterModal;
+  end;
+end;
+
+{ ---- OK 后的后半段流程 ---- }
+
+procedure TAddTorrentForm.StepOKAfterModal;
+begin
+  FStep:=4;
+  FOKClicked:=True;
+
+  if FIsAppHidden then
+    ShowWaitMsg(Caption);
+  EnableControls(False);
+
+  // 如果目录变了：先删旧的，再重新添加
+  // 两个请求在 RPC 队列中按顺序执行，不需要等 remove 回调
+  if FOldDownloadDir <> cbDestFolder.Text then begin
+    MainForm.QueueTorrentAction(FTorrentId, 'torrent-remove', nil, False);
+    FTorrentId:=0;
+    StepTorrentAdd; // 重新添加，新目录
+    exit;
+  end;
+
+  StepTorrentSet;
+end;
+
+procedure TAddTorrentForm.StepTorrentSet;
+var
+  req, args: TJSONObject;
+  files: TJSONArray;
+  request: TRpcUserRequest;
+  i: integer;
+begin
+  FStep:=5;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-set');
+    args:=TJSONObject.Create;
+    args.Add('ids', TJSONArray.Create([FTorrentId]));
+    args.Add('peer-limit', TJSONIntegerNumber.Create(edPeerLimit.Value));
+
+    files:=TJSONArray.Create;
+    for i:=0 to lvFiles.Items.Count - 1 do
+      if not FilesTree.IsFolder(i) and (FilesTree.Checked[i] = cbChecked) then
+        files.Add(integer(lvFiles.Items[idxFileId, i]));
+    if files.Count > 0 then
+      args.Add('files-wanted', files)
+    else
+      files.Free;
+
+    files:=TJSONArray.Create;
+    for i:=0 to lvFiles.Items.Count - 1 do
+      if not FilesTree.IsFolder(i) and (FilesTree.Checked[i] <> cbChecked) then
+        files.Add(integer(lvFiles.Items[idxFileId, i]));
+    if files.Count > 0 then
+      args.Add('files-unwanted', files)
+    else
+      files.Free;
+
+    req.Add('arguments', args);
+
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, False, -1, @TorrentSetCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+      AsyncFinish(False);
+      exit;
+    end;
+    req:=nil;
+  finally
+    req.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.TorrentSetCompleted(ARequest: TObject);
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AsyncFinish(False);
+    exit;
+  end;
+  if TRpcUserRequest(ARequest).Result = nil then begin
+    MainForm.CheckStatus(False);
+    AsyncFinish(False);
+    exit;
+  end;
+
+  // 检查是否需要重命名
+  edSaveAs.Text:=ExcludeInvalidChar(edSaveAs.Text);
+  if FOldName <> edSaveAs.Text then begin
+    StepTorrentRename;
+    exit;
+  end;
+
+  StepTorrentStart;
+end;
+
+procedure TAddTorrentForm.StepTorrentRename;
+var
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+begin
+  FStep:=6;
+  req:=TJSONObject.Create;
+  try
+    req.Add('method', 'torrent-rename-path');
+    args:=TJSONObject.Create;
+    args.Add('ids', TJSONArray.Create([FTorrentId]));
+    args.Add('path', UTF8Decode(FOldName));
+    args.Add('name', UTF8Decode(edSaveAs.Text));
+    req.Add('arguments', args);
+
+    FRequestLifetime.AddRef;
+    request:=TRpcUserRequest.Create(req, False, -1, @TorrentRenameCompleted, FRequestLifetime);
+    if not RpcObj.QueueUserRequest(request) then begin
+      FRequestLifetime.Release;
+      // 重命名失败不终止，继续
+      StepTorrentStart;
+      exit;
+    end;
+    req:=nil;
+  finally
+    req.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.TorrentRenameCompleted(ARequest: TObject);
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AsyncFinish(False);
+    exit;
+  end;
+  // 重命名失败不终止，继续
+  StepTorrentStart;
+end;
+
+procedure TAddTorrentForm.StepTorrentStart;
+begin
+  FStep:=7;
+  if cbStartTorrent.Checked then
+    MainForm.QueueTorrentAction(FTorrentId, 'torrent-start', nil, True);
+
+  // post-add filter + 选中 torrent（用 PostAddTorrentId 机制异步选中）
+  if FPostAddFilterKind <> pafNone then begin
+    MainForm.PostAddTorrentId:=FTorrentId;
+    MainForm.PostAddFilterKind:=FPostAddFilterKind;
+  end
+  else begin
+    MainForm.PostAddTorrentId:=FTorrentId;
+    MainForm.PostAddFilterKind:=pafNone;
+  end;
+  MainForm.DoRefresh(True);
+
+  // 清理文件 + 保存配置
+  if (Ini.ReadBool('Interface', 'DeleteTorrentFile', False) and not IsProtocolSupported(FFileName)) or MainForm.WatchDownloading then
+    DeleteFileUTF8(FFileName);
+
+  Ini.WriteInteger(FIniSec, 'PeerLimit', edPeerLimit.Value);
+  MainForm.SaveDownloadDirs(cbDestFolder, 'LastDownloadDir');
+
+  // 完成
+  AsyncFinish(True);
+end;
+
+procedure TAddTorrentForm.TorrentStartCompleted(ARequest: TObject);
+begin
+  // 预留：如果以后需要等启动完成再结束，可以在这里调用 AsyncFinish
+  // 目前不等启动完成，发完请求就结束
+end;
+
+{ ============================================================================
+  _AddTrackers 子流程（重复种子时合并 tracker）
+  ============================================================================ }
+
+procedure TAddTorrentForm.BeginAddTrackers(TorrentId: integer);
+var
+  s: string;
+  i: integer;
+begin
+  FStep:=10;
+  FAddTrackersTorrentId:=TorrentId;
+  FAddTrackersHash:='';
+
+  RpcObj.Status:='';
+  s:='';
+  if TorrentId <> 0 then begin
+    i:=MainForm.gTorrents.Items.IndexOf(idxTorrentId, TorrentId);
+    if i >= 0 then
+      s:=Format(': %s', [UTF8Encode(widestring(MainForm.gTorrents.Items[idxName, i]))]);
+  end;
+  ForceAppNormal;
+  s:=TranslateString(SDuplicateTorrent + s + '.', True);
+  if RpcObj.RPCVersion < 10 then begin
+    MessageDlg(s, mtError, [mbOK], 0);
+    AsyncFinish(False);
+    exit;
+  end;
+  if MessageDlg(s + LineEnding + LineEnding + SUpdateTrackers, mtConfirmation, [mbYes, mbNo], 0) <> mrYes then begin
+    AsyncFinish(False);
+    exit;
+  end;
+
+  AddTrackersConfirmYes;
+end;
+
+procedure TAddTorrentForm.AddTrackersConfirmYes;
+var
+  TrackersList: TStringList;
+  fs: TFileStreamUTF8;
+  TorData, AnnData, LData, LLData: TBEncoded;
+  i, j: Integer;
+  s, tfn, TorrentHash: string;
+  req, args: TJSONObject;
+  _fields: TJSONArray;
+  request: TRpcUserRequest;
+begin
+  TrackersList:=TStringList.Create;
+  AppBusy;
+  try
+    TorrentHash:='';
+    if AnsiCompareText('magnet:?', Copy(FFileName, 1, 8)) = 0 then begin
+      // 从 magnet 链接解析 trackers
+      TrackersList.Delimiter:='&';
+      TrackersList.DelimitedText:=Copy(FFileName, 9, MaxInt);
+      i:=0;
+      while i < TrackersList.Count do begin
+        s:=TrackersList.Names[i];
+        if (FAddTrackersTorrentId = 0) and (CompareText(s, 'xt') = 0) then begin
+          s:=LowerCase(TrackersList.ValueFromIndex[i]);
+          if (TorrentHash = '') and (Pos('urn:btih:', s) = 1) then begin
+            s:=Copy(s, 10, MaxInt);
+            if Length(s) = 32 then
+              TorrentHash:=StrToHex(Base32Decode(UpperCase(s)))
+            else
+              TorrentHash:=s;
+          end;
+        end
+        else
+          if CompareText(s, 'tr') = 0 then begin
+            TrackersList[i]:=DecodeURL(TrackersList.ValueFromIndex[i]);
+            Inc(i);
+            continue;
+          end;
+        TrackersList.Delete(i);
+      end;
+    end
+    else
+      try
+        if IsProtocolSupported(FFileName) then begin
+          tfn:=SysToUTF8(GetTempDir(True)) + 'remote-torrent.torrent';
+          if not DownloadFile(FFileName, ExtractFilePath(tfn), ExtractFileName(tfn), SDownloadingTorrent) then begin
+            AppNormal;
+            AsyncFinish(False);
+            exit;
+          end;
+        end
+        else
+          tfn:=FFileName;
+
+        TorData:=nil;
+        fs:=TFileStreamUTF8.Create(tfn, fmOpenRead or fmShareDenyNone);
+        try
+          TorData:=TBEncoded.Create(fs);
+          if FAddTrackersTorrentId = 0 then begin
+            LData:=(TorData.ListData.FindElement('info') as TBEncoded);
+            s:='';
+            LData.Encode(LData, s);
+            TorrentHash:=StrToHex(SHA1(s));
+          end;
+          AnnData:=(TorData.ListData.FindElement('announce-list', False) as TBEncoded);
+          if AnnData <> nil then
+            for i:=0 to AnnData.ListData.Count - 1 do begin
+              LData:=AnnData.ListData.Items[i].Data as TBEncoded;
+              for j:=0 to LData.ListData.Count - 1 do begin
+                LLData:=LData.ListData.Items[j].Data as TBEncoded;
+                TrackersList.Add(LLData.StringData);
+              end;
+            end
+          else begin
+            AnnData:=(TorData.ListData.FindElement('announce', False) as TBEncoded);
+            if AnnData <> nil then
+              TrackersList.Add(AnnData.StringData);
+          end;
+        finally
+          TorData.Free;
+          fs.Free;
+        end;
+      finally
+        if (tfn <> '') and (tfn <> FFileName) then
+          DeleteFileUTF8(tfn);
+      end;
+
+    FAddTrackersHash:=TorrentHash;
+    FAddTrackersList:=TrackersList; // 移交所有权
+    TrackersList:=nil;
+
+    // 发 torrent-get 获取已有 trackers
+    req:=TJSONObject.Create;
+    try
+      req.Add('method', 'torrent-get');
+      args:=TJSONObject.Create;
+      if FAddTrackersTorrentId = 0 then
+        args.Add('ids', TJSONArray.Create([FAddTrackersHash]))
+      else
+        args.Add('ids', TJSONArray.Create([FAddTrackersTorrentId]));
+      _fields:=TJSONArray.Create(['id', 'trackers']);
+      args.Add('fields', _fields);
+      req.Add('arguments', args);
+
+      FRequestLifetime.AddRef;
+      request:=TRpcUserRequest.Create(req, True, -1, @AddTrackersGetCompleted, FRequestLifetime);
+      if not RpcObj.QueueUserRequest(request) then begin
+        FRequestLifetime.Release;
+        MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+        AddTrackersFinish;
+        exit;
+      end;
+      req:=nil;
+    finally
+      req.Free;
+    end;
+  finally
+    TrackersList.Free;
+  end;
+end;
+
+procedure TAddTorrentForm.AddTrackersGetCompleted(ARequest: TObject);
+var
+  res: TJSONObject;
+  t: TJSONArray;
+  tt: TJSONObject;
+  trackers: TJSONArray;
+  i, j: integer;
+  s: string;
+  addTrackers: TJSONArray;
+  req, args: TJSONObject;
+  request: TRpcUserRequest;
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AddTrackersFinish;
+    exit;
+  end;
+  res:=TRpcUserRequest(ARequest).Result;
+  if res = nil then begin
+    MainForm.CheckStatus(False);
+    AddTrackersFinish;
+    exit;
+  end;
+
+  try
+    t:=res.Arrays['torrents'];
+    if t.Count = 0 then
+      raise Exception.Create('Torrent not found.');
+    tt:=t.Objects[0] as TJSONObject;
+    i:=tt.Integers['id'];
+    if FAddTrackersTorrentId = 0 then begin
+      FAddTrackersTorrentId:=i;
+      // 异步选中：设到 PostAddTorrentId，下次刷新时自动选中
+      MainForm.PostAddTorrentId:=i;
+      MainForm.PostAddFilterKind:=pafNone;
+    end;
+    FTorrentId:=i;
+
+    trackers:=tt.Arrays['trackers'];
+    // 删除已存在的 trackers
+    for i:=0 to trackers.Count - 1 do begin
+      s:=UTF8Encode(trackers.Objects[i].Strings['announce']);
+      j:=FAddTrackersList.IndexOf(s);
+      if j >= 0 then
+        FAddTrackersList.Delete(j);
+    end;
+
+    if FAddTrackersList.Count = 0 then begin
+      // 没有新 tracker 需要添加
+      MainForm.DoRefresh;
+      AddTrackersFinish;
+      exit;
+    end;
+
+    // 发 torrent-set(trackerAdd)
+    addTrackers:=TJSONArray.Create;
+    for i:=0 to FAddTrackersList.Count - 1 do
+      addTrackers.Add(FAddTrackersList[i]);
+    req:=TJSONObject.Create;
+    try
+      req.Add('method', 'torrent-set');
+      args:=TJSONObject.Create;
+      args.Add('ids', TJSONArray.Create([FAddTrackersTorrentId]));
+      args.Add('trackerAdd', addTrackers);
+      addTrackers:=nil;
+      req.Add('arguments', args);
+
+      FRequestLifetime.AddRef;
+      request:=TRpcUserRequest.Create(req, False, -1, @AddTrackersSetCompleted, FRequestLifetime);
+      if not RpcObj.QueueUserRequest(request) then begin
+        FRequestLifetime.Release;
+        MessageDlg('Unable to queue RPC request.', mtError, [mbOK], 0);
+        AddTrackersFinish;
+        exit;
+      end;
+      req:=nil;
+    finally
+      req.Free;
+      addTrackers.Free;
+    end;
+  except
+    on E: Exception do begin
+      MessageDlg(E.Message, mtError, [mbOK], 0);
+      AddTrackersFinish;
+    end;
+  end;
+end;
+
+procedure TAddTorrentForm.AddTrackersSetCompleted(ARequest: TObject);
+begin
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    AddTrackersFinish;
+    exit;
+  end;
+  if TRpcUserRequest(ARequest).Result = nil then begin
+    MainForm.CheckStatus(False);
+  end
+  else begin
+    MainForm.DoRefresh;
+  end;
+  AddTrackersFinish;
+end;
+
+procedure TAddTorrentForm.AddTrackersFinish;
+begin
+  if FAddTrackersList <> nil then
+    FreeAndNil(FAddTrackersList);
+  AppNormal;
+  FTorrentId:=0; // 重复种子，id 是已有的，不应该由 MainForm 清理
+  AsyncFinish(False); // 重复种子不算"成功添加"
 end;
 
 initialization

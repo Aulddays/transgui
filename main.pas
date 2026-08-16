@@ -157,7 +157,6 @@ type
     Lst: TDate;
   end;
 
-  TPostAddFilterKind = (pafNone, pafPath, pafTracker);
 
   { TProgressImage }
 
@@ -721,7 +720,7 @@ type
     procedure LoadColumns(LV: TVarGrid; const AName: string; FullInfo: boolean = True);
     function GetTorrentError(t: TJSONObject; Status: integer): string;
     function SecondsToString(j: integer): string;
-    function DoAddTorrent(const FileName: Utf8String): boolean;
+    procedure DoAddTorrent(const FileName: Utf8String);
     procedure UpdateTray;
     procedure HideApp;
     procedure ShowApp;
@@ -738,7 +737,6 @@ type
     function GetPeersText(Peers, PeersTotal, Leechers: integer): string;
     function RatioToString(Ratio: double): string;
     function TorrentDateTimeToString(d: Int64; FromNow:Boolean = false): string;
-    procedure DoRefresh(All: boolean = False);
     function GetFilesCommonPath(files: TJSONArray): string;
     procedure InternalRemoveTorrent(const Msg, MsgMulti: string; RemoveLocalData: boolean);
     function IncludeProperTrailingPathDelimiter(const s: string): string;
@@ -748,8 +746,6 @@ type
     function ExecRemoteFile(const FileName: string; SelectFile: boolean; Userdef: boolean= false): boolean;
     function GetSelectedTorrents: variant;
     function GetDisplayedTorrents: variant;
-    procedure FillDownloadDirs(CB: TComboBox; const CurFolderParam: string);
-    procedure SaveDownloadDirs(CB: TComboBox; const CurFolderParam: string);
     procedure DeleteDirs(CB: TComboBox; maxdel : Integer);
     procedure SetRefreshInterval;
     procedure AddTracker(EditMode: boolean);
@@ -769,9 +765,13 @@ type
     procedure DetailsUpdated;
     function RenameTorrent(TorrentId: integer; const OldPath, NewName: string): boolean;
     procedure FilesTreeStateChanged(Sender: TObject);
-    function SelectTorrent(TorrentId, TimeOut: integer): integer;
     procedure OpenCurrentTorrent(OpenFolderOnly: boolean; UserDef: boolean=false);
   public
+    property CurConn: string read FCurConn;
+    property WatchDownloading: boolean read FWatchDownloading write FWatchDownloading;
+    property WatchDestinationFolder: string read FWatchDestinationFolder write FWatchDestinationFolder;
+    property PostAddTorrentId: integer read FPostAddTorrentId write FPostAddTorrentId;
+    property PostAddFilterKind: TPostAddFilterKind read FPostAddFilterKind write FPostAddFilterKind;
     procedure FillTorrentsList(list: TJSONArray);
     procedure FillPeersList(list: TJSONArray);
     procedure FillFilesList(ATorrentId: integer; list, priorities, wanted: TJSONArray; const DownloadDir: WideString);
@@ -780,7 +780,9 @@ type
     procedure FillSessionInfo(s: TJSONObject);
     procedure FillStatistics(s: TJSONObject);
     procedure CheckStatus(Fatal: boolean = True);
-    function TorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject = nil): boolean;
+    procedure DoRefresh(All: boolean = False);
+    procedure FillDownloadDirs(CB: TComboBox; const CurFolderParam: string);
+    procedure SaveDownloadDirs(CB: TComboBox; const CurFolderParam: string);
     function QueueTorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject = nil; ARefresh: boolean = True): boolean;
     function SetFilePriority(TorrentId: integer; const Files: array of integer; const APriority: string): boolean;
     function SetCurrentFilePriority(const APriority: string): boolean;
@@ -810,6 +812,7 @@ end;
 procedure DebugLog(const Msg: string);
 
 function ExcludeInvalidChar (path: string): string; // PETROV
+function IsProtocolSupported(const url: string): boolean;
 function GetBiDi: TBiDiMode;
 function CheckAppParams: boolean;
 procedure LoadTranslation;
@@ -2450,563 +2453,44 @@ begin
   end;
 end;
 
-function TMainForm.DoAddTorrent(const FileName: Utf8String): boolean;
+procedure TMainForm.DoAddTorrent(const FileName: Utf8String);
 var
-  torrent: string;
-  WaitForm: TBaseForm;
-  IsAppHidden: boolean;
-  PostAddFilterKind: TPostAddFilterKind;
-
-  Procedure _AddTrackers(TorrentId: integer);
-  var
-    req, args: TJSONObject;
-    fs: TFileStreamUTF8;
-    TorData, AnnData, LData, LLData: TBEncoded;
-    t: TJSONArray;
-    tt: TJSONObject;
-    trackers: TJSONArray;
-    i, j: Integer;
-    s, tfn, TorrentHash: string;
-    TrackersList: TStringList;
-  begin
-    RpcObj.Status:='';
-    s:='';
-    if TorrentId <> 0 then begin
-      i:=SelectTorrent(TorrentId, 2000);
-      if i >= 0 then
-        s:=Format(': %s', [UTF8Encode(widestring(gTorrents.Items[idxName, i]))]);
-
-    end;
-    ForceAppNormal;
-    s:=TranslateString(SDuplicateTorrent + s + '.', True);
-    if RpcObj.RPCVersion < 10 then begin
-      MessageDlg(s, mtError, [mbOK], 0);
-      exit;
-    end;
-    if MessageDlg(s + LineEnding + LineEnding + SUpdateTrackers, mtConfirmation, [mbYes, mbNo], 0) <> mrYes then
-      exit;
-    Application.ProcessMessages;
-    TrackersList:=TStringList.Create;
-    try
-      TorrentHash:='';
-      if AnsiCompareText('magnet:?', Copy(FileName, 1, 8)) = 0 then begin
-        // Get trackers from the magnet link
-        TrackersList.Delimiter:='&';
-        TrackersList.DelimitedText:=Copy(FileName, 9, MaxInt);
-        i:=0;
-        while i < TrackersList.Count do begin
-          s:=TrackersList.Names[i];
-          if (TorrentId = 0) and (CompareText(s, 'xt') = 0) then begin
-            s:=LowerCase(TrackersList.ValueFromIndex[i]);
-            if (TorrentHash = '') and (Pos('urn:btih:', s) = 1) then begin
-              s:=Copy(s, 10, MaxInt);
-              if Length(s) = 32 then
-                // base32 encoded hash
-                TorrentHash:=StrToHex(Base32Decode(UpperCase(s)))
-              else
-                TorrentHash:=s;
-            end;
-          end
-          else
-            if CompareText(s, 'tr') = 0 then begin
-              TrackersList[i]:=DecodeURL(TrackersList.ValueFromIndex[i]);
-              Inc(i);
-              continue;
-            end;
-          TrackersList.Delete(i);
-        end;
-      end
-      else
-      try
-        if IsProtocolSupported(FileName) then begin
-          // Downloading torrent file
-          tfn:=SysToUTF8(GetTempDir(True)) + 'remote-torrent.torrent';
-          if not DownloadFile(FileName, ExtractFilePath(tfn), ExtractFileName(tfn), SDownloadingTorrent) then
-            exit;
-        end
-        else
-          tfn:=FileName;
-        // Read trackers from the torrent file...
-        AppBusy;
-        TorData:=nil;
-        fs:=TFileStreamUTF8.Create(tfn, fmOpenRead or fmShareDenyNone);
-        try
-          TorData:=TBEncoded.Create(fs);
-          if TorrentId = 0 then begin
-            // Calculate torrent hash
-            LData:=(TorData.ListData.FindElement('info') as TBEncoded);
-            s:='';
-            LData.Encode(LData, s);
-            TorrentHash:=StrToHex(SHA1(s));
-          end;
-          AnnData:=(TorData.ListData.FindElement('announce-list', False) as TBEncoded);
-          if AnnData <> nil then
-            for i:=0 to AnnData.ListData.Count - 1 do begin
-              LData:=AnnData.ListData.Items[i].Data as TBEncoded;
-              for j:=0 to LData.ListData.Count - 1 do begin
-                LLData:=LData.ListData.Items[j].Data as TBEncoded;
-                TrackersList.Add(LLData.StringData);
-              end;
-            end
-          else begin
-            AnnData:=(TorData.ListData.FindElement('announce', False) as TBEncoded);
-            if AnnData <> nil then
-              TrackersList.Add(AnnData.StringData);
-          end;
-        finally
-          TorData.Free;
-          fs.Free;
-        end;
-      finally
-        // Delete temp file
-        if (tfn <> '') and (tfn <> FileName) then
-          DeleteFileUTF8(tfn);
-      end;
-
-      // Request trackers from the existing torrent
-      req:=TJSONObject.Create;
-      try
-        req.Add('method', 'torrent-get');
-        args:=TJSONObject.Create;
-        if TorrentId = 0 then
-          args.Add('ids', TJSONArray.Create([TorrentHash]))
-        else
-          args.Add('ids', TJSONArray.Create([TorrentId]));
-        args.Add('fields', TJSONArray.Create(['id', 'trackers']));
-        req.Add('arguments', args);
-        args:=RpcObj.SendRequest(req);
-        if args = nil then begin
-          CheckStatus(False);
-          exit;
-        end;
-        try
-          t:=args.Arrays['torrents'];
-          if t.Count = 0 then
-            raise Exception.Create('Torrent not found.');
-          tt:=t.Objects[0] as TJSONObject;
-          i:=tt.Integers['id'];
-          if TorrentId = 0 then
-            SelectTorrent(i, 2000);
-          TorrentId:=i;
-          trackers:=tt.Arrays['trackers'];
-          // Deleting existing trackers from the list
-          for i:=0 to trackers.Count - 1 do begin
-            s:=UTF8Encode((Trackers.Items[i] as TJSONObject).Strings['announce']);
-            j:=TrackersList.IndexOf(s);
-            if j >= 0 then
-              TrackersList.Delete(j);
-          end;
-        finally
-          args.Free;
-        end;
-      finally
-        req.Free;
-      end;
-
-      if TrackersList.Count > 0 then begin
-        trackers:=TJSONArray.Create;
-        for i:=0 to TrackersList.Count - 1 do
-          trackers.Add(TrackersList[i]);
-        args:=TJSONObject.Create;
-        args.Add('ids', TJSONArray.Create([TorrentId]));
-        args.Add('trackerAdd', trackers);
-        req:=TJSONObject.Create;
-        try
-          req.Add('method', 'torrent-set');
-          req.Add('arguments', args);
-          args:=RpcObj.SendRequest(req, False);
-          if args = nil then begin
-            CheckStatus(False);
-            exit;
-          end;
-          args.Free;
-        finally
-          req.Free;
-        end;
-        DoRefresh;
-      end;
-    finally
-      TrackersList.Free;
-      AppNormal;
-    end;
-  end;
-
-  function _AddTorrent(args: TJSONObject): integer;
-  var
-    req: TJSONObject;
-  begin
-    Result:=0;
-    req:=TJSONObject.Create;
-    try
-      req.Add('method', 'torrent-add');
-      if torrent = '-' then
-        args.Add('filename', TJSONString.Create(FileName))
-      else
-        args.Add('metainfo', TJSONString.Create(torrent));
-      req.Add('arguments', args);
-      args:=RpcObj.SendRequest(req);
-      if args <> nil then
-      try
-        if args.IndexOfName('torrent-duplicate') >= 0 then begin
-          _AddTrackers(args.Objects['torrent-duplicate'].Integers['id']);
-          exit;
-        end;
-        Result:=args.Objects['torrent-added'].Integers['id'];
-      finally
-        args.Free;
-      end
-      else
-        if RpcObj.Status='duplicate torrent' then begin
-          _AddTrackers(0);
-          exit;
-        end;
-    finally
-      req.Free;
-    end;
-    if Result = 0 then
-      CheckStatus(False);
-  end;
-
-  procedure ShowWaitMsg(const AText: string);
-  begin
-    if WaitForm = nil then begin
-      WaitForm:=TBaseForm.CreateNew(Self);
-      with WaitForm do begin
-{$ifndef windows}
-        if IsAppHidden then
-          ShowInTaskBar:=stAlways;
-{$endif windows}
-        Caption:=AppName;
-        BorderStyle:=bsToolWindow;
-        BorderIcons:=[];
-        Position:=poScreenCenter;
-        Constraints.MinWidth:=400;
-        AutoSize:=True;
-        BorderWidth:=ScaleInt(16);
-        with TLabel.Create(WaitForm) do begin
-          Alignment:=taCenter;
-          Align:=alClient;
-          Parent:=WaitForm;
-        end;
-      end;
-    end;
-    with WaitForm do begin
-      TLabel(Controls[0]).Caption:=AText + '...';
-      Show;
-      BringToFront;
-{$ifdef lclgtk2}
-      Application.ProcessMessages;
-{$endif lclgtk2}
-      Update;
-{$ifdef lclgtk2}
-      sleep(100);
-      Application.ProcessMessages;
-{$endif lclgtk2}
-    end;
-  end;
-
-  procedure HideWaitMsg;
-  begin
-    if WaitForm <> nil then
-      FreeAndNil(WaitForm);
-  end;
-
-var
-  req, args: TJSONObject;
-  id: integer;
-  t, files: TJSONArray;
-  i: integer;
-  fs: TFileStreamUTF8;
-  s, ss, OldDownloadDir, IniSec, OldName: string;
-  ok: boolean;
-  pFD:FolderData;
+  Form: TAddTorrentForm;
+  Success: boolean;
+  NewTorrentId: integer;
+  NewFilterKind: TPostAddFilterKind;
 begin
-  Result:=False;
-  PostAddFilterKind:=pafNone;
   FPostAddTorrentId:=0;
   FPostAddFilterKind:=pafNone;
   if not RpcObj.Connected and not RpcObj.Connecting then
     if not DoConnect then
       exit;
-  WaitForm:=nil;
-  id:=0;
+
   Inc(FAddingTorrent);
   try
-    AppBusy;
+    Success:=False;
+    NewTorrentId:=0;
+    NewFilterKind:=pafNone;
+    Form:=TAddTorrentForm.Create(Self);
     try
-      IsAppHidden:=not Self.Visible or (Self.WindowState = wsMinimized);
-      with TAddTorrentForm.Create(Self) do
-      try
-        if IsAppHidden then begin
-          ShowWaitMsg(Caption);
-{$ifndef windows}
-          ShowInTaskBar:=stAlways;
-{$endif windows}
-        end;
-
-        Application.ProcessMessages;
-        if IsProtocolSupported(FileName) then
-          torrent:='-'
-        else begin
-          try
-            fs:=TFileStreamUTF8.Create(FileName, fmOpenRead or fmShareDenyNone); // why isnt in try
-          except
-            AppNormal;    // if the clipboard garbage and file cant be created. just go out.
-            HideWaitMsg;
-            exit;
-          end;
-
-          try
-            SetLength(torrent, fs.Size);
-            fs.ReadBuffer(PChar(torrent)^, Length(torrent));
-          finally
-            fs.Free;
-          end;
-          torrent:=EncodeBase64(torrent);
-        end;
-
-        IniSec:='AddTorrent.' + FCurConn;
-        FillDownloadDirs(cbDestFolder, 'LastDownloadDir');
-        if (FWatchDownloading) and (FWatchDestinationFolder <> '') then cbDestFolder.Text:=FWatchDestinationFolder;
-
-        req:=TJSONObject.Create;
-        try
-          req.Add('method', 'session-get');
-          args:=RpcObj.SendRequest(req);
-          if args = nil then begin
-            CheckStatus(False);
-            exit;
-          end;
-          s:=CorrectPath (UTF8Encode(args.Strings['download-dir']) );
-          try
-            if cbDestFolder.Items.IndexOf(s) < 0 then begin
-              pFD    := FolderData.create;
-              pFD.Hit:= 1;
-              pFD.Ext:= '';
-              pFD.Txt:= s;
-              pFD.Lst:= SysUtils.Date;
-              cbDestFolder.Items.Add(s);
-              i := cbDestFolder.Items.IndexOf(s);
-              cbDestFolder.Items.Objects[i]:= pFD;
-            end;
-          except
-            MessageDlg('Error: LS-005. Please contact the developer', mtError, [mbOK], 0);
-          end;
-
-          if RpcObj.RPCVersion < 15 then
-            if args.IndexOfName('download-dir-free-space') >= 0 then
-              txDiskSpace.Caption:=txDiskSpace.Caption + ' ' + GetHumanSize(args.Floats['download-dir-free-space'])
-            else begin
-              txDiskSpace.Hide;
-              txSize.Top:=(txSize.Top + txDiskSpace.Top) div 2;
-            end;
-          args.Free;
-        finally
-          req.Free;
-        end;
-
-        if lvFilter.Row >= StatusFiltersCount then begin
-          i:=lvFilter.Row;
-          if VarIsNull(lvFilter.Items[0, i]) then
-            Dec(i);
-          if i >= StatusFiltersCount then
-            if not VarIsNull(lvFilter.Items[-1, i]) then
-              PostAddFilterKind:=pafPath
-            else
-              PostAddFilterKind:=pafTracker;
-        end;
-        lvFilter.Row:=0;
-        edSearch.Text:='';
-
-        args:=TJSONObject.Create;
-        args.Add('paused', TJSONIntegerNumber.Create(1));
-        i:=Ini.ReadInteger(IniSec, 'PeerLimit', 0);
-        if i <> 0 then
-          args.Add('peer-limit', TJSONIntegerNumber.Create(i));
-
-        // for larazur 1.4 and up.
-        // data can be in the drop-down list, but no text is selected in the window
-        try
-          ss := cbDestFolder.Text;
-          if (ss = '') then begin
-            if (cbDestFolder.Items.Count = 0) then begin
-              ss := s;
-            end else begin
-              cbDestFolder.ItemIndex:=0;
-              ss := cbDestFolder.Text;
-            end;
-          end;
-        except
-          MessageDlg('Error: LS-006. Please contact the developer', mtError, [mbOK], 0);
-        end;
-        args.Add('download-dir', TJSONString.Create(UTF8Decode(ss)));
-        id:=_AddTorrent(args);
-        if id = 0 then
-          exit;
-
-        DoRefresh(True);
-
-        args:=RpcObj.RequestInfo(id, ['files','maxConnectedPeers','name','metadataPercentComplete']);
-        if args = nil then begin
-          CheckStatus(False);
-          exit;
-        end;
-        try
-          t:=args.Arrays['torrents'];
-          if t.Count = 0 then
-            raise Exception.Create(sUnableGetFilesList);
-
-          OldName:=UTF8Encode(t.Objects[0].Strings['name']);
-          edSaveAs.Caption:=OldName;
-          edSaveAs.Caption := ExcludeInvalidChar(edSaveAs.Caption); // petrov - Exclude prohibited characters
-
-          if RpcObj.RPCVersion < 15 then begin
-            edSaveAs.Enabled:=False;
-            edSaveAs.ParentColor:=True;
-          end;
-          edPeerLimit.Value:=t.Objects[0].Integers['maxConnectedPeers'];
-          FilesTree.FillTree(id, t.Objects[0].Arrays['files'], nil, nil);
-          Width:=Ini.ReadInteger('AddTorrent', 'Width', Width);
-          if (RpcObj.RPCVersion >= 7) and (lvFiles.Items.Count = 0) and (t.Objects[0].Floats['metadataPercentComplete'] <> 1.0) then begin
-            // Magnet link
-            gbContents.Hide;
-            gbSaveAs.BorderSpacing.Bottom:=gbSaveAs.BorderSpacing.Top;
-            BorderStyle:=bsDialog;
-            AutoSizeForm(TCustomForm(gbContents.Parent));
-            edSaveAs.Enabled:=False;
-            edSaveAs.ParentColor:=True;
-          end
-          else
-            // Torrent file
-            Height:=Ini.ReadInteger('AddTorrent', 'Height', Height);
-        finally
-          args.Free;
-        end;
-        OldDownloadDir:=cbDestFolder.Text;
-        AppNormal;
-
-        ok:=not Ini.ReadBool('Interface', 'ShowAddTorrentWindow', True);
-        if FWatchDownloading then ok:= true;
-        if ok then
-          btSelectAllClick(nil)
-        else begin
-          HideWaitMsg;
-          ok:=ShowModal = mrOk;
-          if BorderStyle = bsSizeable then begin
-            Ini.WriteInteger('AddTorrent', 'Width', Width);
-            Ini.WriteInteger('AddTorrent', 'Height', Height);
-          end;
-        end;
-
-        if ok then begin
-          if IsAppHidden then
-            ShowWaitMsg(Caption);
-          AppBusy;
-          Self.Update;
-
-          if OldDownloadDir <> cbDestFolder.Text then begin
-            TorrentAction(id, 'torrent-remove');
-            id:=0;
-            args:=TJSONObject.Create;
-            args.Add('paused', TJSONIntegerNumber.Create(1));
-            args.Add('peer-limit', TJSONIntegerNumber.Create(edPeerLimit.Value));
-            args.Add('download-dir', TJSONString.Create(UTF8Decode(cbDestFolder.Text)));
-            id:=_AddTorrent(args);
-            if id = 0 then
-              exit;
-            DoRefresh(True);
-            Application.ProcessMessages;
-          end;
-
-          req:=TJSONObject.Create;
-          try
-            req.Add('method', 'torrent-set');
-            args:=TJSONObject.Create;
-            args.Add('ids', TJSONArray.Create([id]));
-            args.Add('peer-limit', TJSONIntegerNumber.Create(edPeerLimit.Value));
-
-            files:=TJSONArray.Create;
-            for i:=0 to lvFiles.Items.Count - 1 do
-              if not FilesTree.IsFolder(i) and (FilesTree.Checked[i] = cbChecked) then
-                files.Add(integer(lvFiles.Items[idxFileId, i]));
-            if files.Count > 0 then
-              args.Add('files-wanted', files)
-            else
-              files.Free;
-
-            files:=TJSONArray.Create;
-            for i:=0 to lvFiles.Items.Count - 1 do
-              if not FilesTree.IsFolder(i) and (FilesTree.Checked[i] <> cbChecked) then
-                files.Add(integer(lvFiles.Items[idxFileId, i]));
-            if files.Count > 0 then
-              args.Add('files-unwanted', files)
-            else
-              files.Free;
-
-            req.Add('arguments', args);
-            args:=nil;
-            args:=RpcObj.SendRequest(req, False);
-            if args = nil then begin
-              CheckStatus(False);
-              exit;
-            end;
-            args.Free;
-
-//          edSaveAs.Text := Trim(edSaveAs.Text);               // leave spaces to not rename the torrent (see below)
-            edSaveAs.Text := ExcludeInvalidChar(edSaveAs.Text); // Exclude prohibited characters
-
-            if OldName <> edSaveAs.Text then begin
-              // Changing torrent name
-              req.Free;
-              req:=TJSONObject.Create;
-              req.Add('method', 'torrent-rename-path');
-              args:=TJSONObject.Create;
-              args.Add('ids', TJSONArray.Create([id]));
-              args.Add('path', UTF8Decode(OldName));
-              args.Add('name', UTF8Decode(edSaveAs.Text));
-              req.Add('arguments', args);
-              args:=nil;
-              args:=RpcObj.SendRequest(req, False);
-              if args = nil then begin
-                // CheckStatus(False); // failed to rename torrent
-                // exit;               // we continue work (try)
-              end;
-              args.Free;
-            end;
-          finally
-            req.Free;
-          end;
-
-          if cbStartTorrent.Checked then
-            TorrentAction(id, 'torrent-start');
-
-          if PostAddFilterKind <> pafNone then begin
-            FPostAddTorrentId:=id;
-            FPostAddFilterKind:=PostAddFilterKind;
-            DoRefresh(True);
-          end;
-          SelectTorrent(id, 2000);
-
-          id:=0;
-          if (Ini.ReadBool('Interface', 'DeleteTorrentFile', False) and not IsProtocolSupported(FileName)) or (FWatchDownloading) then
-            DeleteFileUTF8(FileName);
-
-          Ini.WriteInteger(IniSec, 'PeerLimit', edPeerLimit.Value);
-          SaveDownloadDirs(cbDestFolder, 'LastDownloadDir');
-          Result:=True;
-          AppNormal;
-        end;
-      finally
-        Free;
-      end;
+      Form.Execute(FileName); // ShowModal 阻塞，内部异步跑 RPC
+      Success:=Form.ModalResult = mrOk;
+      NewTorrentId:=Form.ResultTorrentId;
+      NewFilterKind:=Form.ResultFilterKind;
     finally
-      if id <> 0 then
-        TorrentAction(id, 'torrent-remove');
+      Form.Free;
     end;
+
+    // 失败且有 id，需要清理
+    if not Success and (NewTorrentId <> 0) then
+      QueueTorrentAction(NewTorrentId, 'torrent-remove', nil, True);
   finally
-    HideWaitMsg;
     Dec(FAddingTorrent);
   end;
+
+  // 继续处理下一个 pending torrent
+  if FPendingTorrents.Count > 0 then
+    TickTimer.Enabled:=True;
 end;
 
 procedure TMainForm.UpdateTray;
@@ -6122,9 +5606,14 @@ begin
   end;
 
   // 把 variant 转成动态数组传给 context
-  SetLength(idArr, gTorrents.SelCount);
+  // 注意：GetSelectedTorrents 在 SelCount=0 时也会返回当前行的 id（单元素数组）
+  // 所以这里用 VarArrayHighBound 取实际长度，而不是 SelCount
   if VarIsArray(ids) then
-    for i:=0 to gTorrents.SelCount - 1 do
+    SetLength(idArr, VarArrayHighBound(ids, 1) + 1)
+  else
+    SetLength(idArr, 1);
+  if VarIsArray(ids) then
+    for i:=0 to High(idArr) do
       idArr[i]:=ids[i]
   else
     idArr[0]:=ids;
@@ -6789,44 +6278,6 @@ begin
   end;
 end;
 
-function TMainForm.TorrentAction(const TorrentIds: variant; const AAction: string; args: TJSONObject): boolean;
-var
-  req: TJSONObject;
-  ids: TJSONArray;
-  i: integer;
-begin
-  if VarIsEmpty(TorrentIds) then
-    exit;
-  Application.ProcessMessages;
-  AppBusy;
-  req:=TJSONObject.Create;
-  try
-    req.Add('method', AAction);
-    if args = nil then
-      args:=TJSONObject.Create;
-    if not VarIsNull(TorrentIds) then begin
-      ids:=TJSONArray.Create;
-      if VarIsArray(TorrentIds) then begin
-        for i:=VarArrayLowBound(TorrentIds, 1) to VarArrayHighBound(TorrentIds, 1) do
-          ids.Add(integer(TorrentIds[i]));
-      end
-      else
-        ids.Add(integer(TorrentIds));
-      args.Add('ids', ids);
-    end;
-    req.Add('arguments', args);
-    args:=RpcObj.SendRequest(req, False, 30000);
-    Result:=args <> nil;
-    args.Free;
-  finally
-    req.Free;
-  end;
-  if not Result then
-    CheckStatus(False)
-  else
-    DoRefresh(True);
-  AppNormal;
-end;
 
 function TMainForm.SetFilePriority(TorrentId: integer; const Files: array of integer; const APriority: string): boolean;
 
@@ -7661,7 +7112,7 @@ begin
       finally
         if WasHidden then
           HideTaskbarButton;
-          FWatchDownloading := false;
+        FWatchDownloading := false;
       end;
     end;
   finally
@@ -7836,34 +7287,6 @@ begin
   SetCurrentFilePriority('');
 end;
 
-function TMainForm.SelectTorrent(TorrentId, TimeOut: integer): integer;
-var
-  tt: TDateTime;
-  br: boolean;
-begin
-  Result:=-1;
-  if TorrentId = 0 then
-    exit;
-  br:=False;
-  tt:=Now;
-  while True do begin
-    Application.ProcessMessages;
-    Result:=gTorrents.Items.IndexOf(idxTorrentId, TorrentId);
-    if Result >= 0 then begin
-      gTorrents.RemoveSelection;
-      gTorrents.Row:=Result;
-      RpcObj.CurTorrentId:=TorrentId;
-      if Self.Visible and (Self.WindowState <> wsMinimized) and gTorrents.Enabled then
-        Self.ActiveControl:=gTorrents;
-      break;
-    end;
-    if br then
-      break;
-    Sleep(100);
-    if Now - tt >= TimeOut/MSecsPerDay then
-      br:=True;
-  end;
-end;
 
 procedure TMainForm.QueueOpenTorrent(OpenFolderOnly: boolean; UserDef: boolean);
 var
