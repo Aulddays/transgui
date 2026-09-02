@@ -1486,7 +1486,6 @@ var
   request: TRpcUserRequest;
 begin
   FStep:=1;
-  AppBusy;
   req:=TJSONObject.Create;
   try
     req.Add('method', 'session-get');

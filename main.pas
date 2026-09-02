@@ -2234,7 +2234,8 @@ begin
 
     if ShowModal = mrOk then begin
       SaveDownloadDirs(edTorrentDir, 'LastMoveDir');
-      RpcObj.QueueRefresh([rtDetails]);
+      RpcObj.RequestFullInfo:=True;
+      RpcObj.QueueRefresh([rtTorrents, rtDetails]);
     end;
   finally
     gTorrents.Tag:=0;
