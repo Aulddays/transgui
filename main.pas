@@ -975,7 +975,7 @@ type
     TorrentId: integer;
     OldPath: string;
     NewName: string;
-    Row: integer;   // gTorrents row 或 lvFiles row
+    Row: integer;   // gTorrents row or lvFiles row
   end;
 
   {TMyHashMap}
@@ -2474,7 +2474,7 @@ begin
     NewFilterKind:=pafNone;
     Form:=TAddTorrentForm.Create(Self);
     try
-      Form.Execute(FileName); // ShowModal 阻塞，内部异步跑 RPC
+      Form.Execute(FileName); // ShowModal blocks, RPC runs async inside
       Success:=Form.ModalResult = mrOk;
       NewTorrentId:=Form.ResultTorrentId;
       NewFilterKind:=Form.ResultFilterKind;
@@ -2482,14 +2482,14 @@ begin
       Form.Free;
     end;
 
-    // 失败且有 id，需要清理
+    // Failed with an id — needs cleanup
     if not Success and (NewTorrentId <> 0) then
       QueueTorrentAction(NewTorrentId, 'torrent-remove', nil, True);
   finally
     Dec(FAddingTorrent);
   end;
 
-  // 继续处理下一个 pending torrent
+  // Continue with next pending torrent
   if FPendingTorrents.Count > 0 then
     TickTimer.Enabled:=True;
 end;
@@ -5601,14 +5601,14 @@ begin
       s:=Format(MsgMulti, [gTorrents.SelCount]);
 
     s:=TranslateString(s, True);
-    if MessageDlg('', s, mtConfirmation, mbYesNo, 0, mbNo) <> mrYes then exit;
+    if MessageDlg('', s, mtConfirmation, mbYesNo, 0, mbYes) <> mrYes then exit;
   finally
     gTorrents.Tag:=0;
   end;
 
-  // 把 variant 转成动态数组传给 context
-  // 注意：GetSelectedTorrents 在 SelCount=0 时也会返回当前行的 id（单元素数组）
-  // 所以这里用 VarArrayHighBound 取实际长度，而不是 SelCount
+  // Convert variant to dynamic array to pass to context
+  // Note: GetSelectedTorrents also returns the current row id when SelCount=0 (single-element array)
+  // so we use VarArrayHighBound for the actual length instead of SelCount
   if VarIsArray(ids) then
     SetLength(idArr, VarArrayHighBound(ids, 1) + 1)
   else
@@ -5682,7 +5682,7 @@ begin
       exit;
     end;
 
-    // 本地标记为已删除
+    // Locally mark as removed
     with gTorrents do begin
       BeginUpdate;
       try
@@ -7182,7 +7182,7 @@ end;
 
 function TMainForm.RenameTorrent(TorrentId: integer; const OldPath, NewName: string): boolean;
 begin
-  // 保留旧函数签名，但内部改为异步提交；返回值恒为 True（调用方不再依赖返回值）
+  // Keeps old signature but submits asynchronously internally; always returns True (callers no longer depend on the return value)
   if ExtractFileName(OldPath) = NewName then begin
     Result:=False;
     exit;
@@ -7248,16 +7248,16 @@ begin
     case ctx.Mode of
       RM_TORRENT_NAME:
         begin
-          // 更新任务列表中的名称
+          // Update name in torrent list
           gTorrents.Items[idxName, ctx.Row]:=UTF8Decode(ctx.NewName);
           FFilesTree.Clear;
         end;
       RM_FILE_NAME:
         begin
-          // 更新文件列表中的名称
+          // Update name in file list
           FFiles[idxFileName, ctx.Row]:=UTF8Decode(ctx.NewName);
           if FFilesTree.IsFolder(ctx.Row) then begin
-            // 更新子元素路径
+            // Update child element paths
             p:=ctx.OldPath;
             len:=Length(p);
             p:=ExtractFilePath(p) + ctx.NewName;
@@ -7325,7 +7325,7 @@ begin
       exit;
     end;
     req:=nil;
-    ctx:=nil;  // request 持有并释放
+    ctx:=nil;  // owned and freed by the request
   finally
     req.Free;
     ctx.Free;

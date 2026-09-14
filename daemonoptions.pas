@@ -457,7 +457,7 @@ begin
     cbMaxUp.Checked:=args.Integers['speed-limit-up-enabled'] <> 0;
     edMaxUp.Value:=args.Integers['speed-limit-up'];
   finally
-    // args 由 TRpcUserRequest 管理生命周期，这里不释放
+    // args is owned by TRpcUserRequest, don't free it here
   end;
 end;
 

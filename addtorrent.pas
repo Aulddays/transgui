@@ -83,28 +83,30 @@ type
     FDiskSpaceCaption: string;
     FTree: TFilesTree;
     FRequestLifetime: TRpcRequestLifetime;
-    // ---- 异步添加流程状态 ----
-    FFileName: Utf8String;       // 原始文件名或URL
-    FTorrentData: string;        // base64 编码的 torrent 数据，或 '-' 表示 URL/magnet
-    FTorrentId: integer;         // 当前添加的 torrent id
-    FOldName: string;            // 原始名称（用于重命名判断）
-    FOldDownloadDir: string;     // 原始下载目录（用于目录变更判断）
+    FFreeSpaceInFlight: boolean;  // whether a free-space request is in flight
+    FFreeSpaceDirty: boolean;     // path changed again, need to re-query
+    // ---- async add torrent state ----
+    FFileName: Utf8String;       // original file name or URL
+    FTorrentData: string;        // base64-encoded torrent data, or '-' for URL/magnet
+    FTorrentId: integer;         // current torrent id being added
+    FOldName: string;            // original name (for rename detection)
+    FOldDownloadDir: string;     // original download dir (for dir change detection)
     FIniSec: string;             // Ini section: 'AddTorrent.' + FCurConn
     FPostAddFilterKind: TPostAddFilterKind;
     FIsAppHidden: boolean;
     FWaitForm: TBaseForm;
-    FStep: integer;              // 当前步骤（调试/状态追踪用）
-    FAddTrackersTorrentId: integer; // _AddTrackers 子流程用
-    FAddTrackersHash: string;    // _AddTrackers 子流程用 hash
-    FAddTrackersList: TStringList; // _AddTrackers 子流程用 tracker 列表
-    FOKClicked: boolean;         // 用户是否点了OK
-    FInitialized: boolean;       // FormShow 是否已初始化（防止重复触发）
-    FInitError: string;          // 初始化错误信息
+    FStep: integer;              // current step (for debugging / state tracking)
+    FAddTrackersTorrentId: integer; // used by _AddTrackers sub-flow
+    FAddTrackersHash: string;    // used by _AddTrackers sub-flow (hash)
+    FAddTrackersList: TStringList; // used by _AddTrackers sub-flow (tracker list)
+    FOKClicked: boolean;         // whether user clicked OK
+    FInitialized: boolean;       // FormShow has initialized (prevents re-trigger)
+    FInitError: string;          // init error message
     procedure TreeStateChanged(Sender: TObject);
     procedure UpdateSize;
     procedure FreeSpaceCompleted(ARequest: TObject);
     procedure EnableControls(AEnabled: Boolean);
-    // ---- 异步流程回调 ----
+    // ---- async flow callbacks ----
     procedure AsyncFinish(ASuccess: boolean);
     procedure ShowWaitMsg(const AText: string);
     procedure HideWaitMsg;
@@ -121,7 +123,7 @@ type
     procedure TorrentRenameCompleted(ARequest: TObject);
     procedure StepTorrentStart;
     procedure TorrentStartCompleted(ARequest: TObject);
-    // ---- _AddTrackers 子流程 ----
+    // ---- _AddTrackers sub-flow ----
     procedure BeginAddTrackers(TorrentId: integer);
     procedure AddTrackersConfirmYes;
     procedure AddTrackersGetCompleted(ARequest: TObject);
@@ -133,7 +135,7 @@ type
     property FilesTree: TFilesTree read FTree;
     property ResultTorrentId: integer read FTorrentId;
     property ResultFilterKind: TPostAddFilterKind read FPostAddFilterKind;
-    procedure Execute(const AFileName: Utf8String); // 入口（内部 ShowModal）
+    procedure Execute(const AFileName: Utf8String); // entry point (calls ShowModal internally)
   end;
 
   TFolderInfo = record
@@ -895,14 +897,14 @@ begin
   if FInitialized then exit;
   FInitialized:=True;
 
-  // 初始化失败，直接关闭
+  // Init failed, close immediately
   if FInitError <> '' then begin
     MessageDlg(FInitError, mtError, [mbOK], 0);
     ModalResult:=mrCancel;
     exit;
   end;
 
-  // 启动异步流程：第一步 session-get
+  // Start async flow: first step is session-get
   EnableControls(False);
   StepSessionGet;
 end;
@@ -914,7 +916,7 @@ begin
   for i:=0 to ComponentCount - 1 do
     if Components[i] is TWinControl then
       TWinControl(Components[i]).Enabled:=AEnabled;
-  Buttons.CancelButton.Enabled:=True; // Cancel 始终可用
+  Buttons.CancelButton.Enabled:=True; // Cancel is always enabled
   Buttons.OKButton.Enabled:=AEnabled;
   if AEnabled then
     AppNormal
@@ -1017,7 +1019,7 @@ begin
     end;
   end;
 
-  // 异步化：不再直接关闭，而是启动后续 RPC 流程
+  // Async flow: don't close immediately, start the RPC sequence instead
   Buttons.OKButton.Enabled:=False;
   StepOKAfterModal;
 end;
@@ -1118,6 +1120,13 @@ begin
   DiskSpaceTimer.Enabled:=False;
   if RpcObj.RPCVersion < 15 then
     exit;
+
+  // A request is already in flight — mark dirty, re-query after it returns
+  if FFreeSpaceInFlight then begin
+    FFreeSpaceDirty:=True;
+    exit;
+  end;
+
   req:=TJSONObject.Create;
   try
     req.Add('method', 'free-space');
@@ -1126,8 +1135,10 @@ begin
     req.Add('arguments', args);
 
     FRequestLifetime.AddRef;
+    FFreeSpaceInFlight:=True;
     request:=TRpcUserRequest.Create(req, True, -1, @FreeSpaceCompleted, FRequestLifetime);
     if not RpcObj.QueueUserRequest(request) then begin
+      FFreeSpaceInFlight:=False;
       FRequestLifetime.Release;
       txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(-1);
       exit;
@@ -1338,18 +1349,31 @@ var
   f: double;
   res: TJSONObject;
 begin
-  if TRpcUserRequest(ARequest).Cancelled then
+  FRequestLifetime.Release;
+  if TRpcUserRequest(ARequest).Cancelled then begin
+    FFreeSpaceInFlight:=False;
+    FFreeSpaceDirty:=False;
     exit;
+  end;
   res:=TRpcUserRequest(ARequest).Result;
   if res <> nil then
     f:=res.Floats['size-bytes']
-  else
+  else begin
     f:=-1;
+    RpcObj.Status:='';  // clear free-space error status to prevent global CheckStatus from popping up
+  end;
   txDiskSpace.Caption:=FDiskSpaceCaption + ' ' + GetHumanSize(f);
+
+  FFreeSpaceInFlight:=False;
+  // Path changed again — re-query with the latest path
+  if FFreeSpaceDirty then begin
+    FFreeSpaceDirty:=False;
+    DiskSpaceTimerTimer(nil);
+  end;
 end;
 
 { ============================================================================
-  异步添加种子流程
+  Async torrent add flow
   ============================================================================ }
 
 procedure TAddTorrentForm.ShowWaitMsg(const AText: string);
@@ -1402,11 +1426,11 @@ begin
   AppNormal;
   FRequestLifetime.Active:=False;
 
-  // 如果失败，把 FTorrentId 保留（MainForm 用来清理）
-  // 如果成功，FTorrentId 也保留（MainForm 用来 post-add filter）
-  // 都通过 public 属性 ResultTorrentId / ResultFilterKind 暴露
+  // On failure, keep FTorrentId (MainForm uses it for cleanup)
+  // On success, keep FTorrentId too (MainForm uses it for post-add filter)
+  // Both are exposed via public properties ResultTorrentId / ResultFilterKind
 
-  // 关闭模态对话框
+  // Close the modal dialog
   if ASuccess then
     ModalResult:=mrOk
   else
@@ -1433,7 +1457,7 @@ begin
 {$endif windows}
   end;
 
-  // 读取 torrent 文件或标记为 URL
+  // Read torrent file or mark as URL
   if IsProtocolSupported(FFileName) then
     FTorrentData:='-'
   else begin
@@ -1456,13 +1480,13 @@ begin
     FTorrentData:=EncodeBase64(FTorrentData);
   end;
 
-  // 准备 Ini section 和目录列表
+  // Prepare Ini section and directory list
   FIniSec:='AddTorrent.' + MainForm.CurConn;
   MainForm.FillDownloadDirs(cbDestFolder, 'LastDownloadDir');
   if MainForm.WatchDownloading and (MainForm.WatchDestinationFolder <> '') then
     cbDestFolder.Text:=MainForm.WatchDestinationFolder;
 
-  // 记录 post-add filter 信息
+  // Record post-add filter info
   if MainForm.lvFilter.Row >= StatusFiltersCount then begin
     i:=MainForm.lvFilter.Row;
     if VarIsNull(MainForm.lvFilter.Items[0, i]) then
@@ -1476,7 +1500,7 @@ begin
   MainForm.lvFilter.Row:=0;
   MainForm.edSearch.Text:='';
 
-  // 显示模态对话框，FormShow 里启动异步流程
+  // Show modal dialog; async flow starts in FormShow
   ShowModal;
 end;
 
@@ -1522,7 +1546,7 @@ begin
     exit;
   end;
 
-  // 填默认目录到下拉框
+  // Fill default dir into the dropdown
   s:=CorrectPath(UTF8Encode(res.Strings['download-dir']));
   try
     if cbDestFolder.Items.IndexOf(s) < 0 then begin
@@ -1539,7 +1563,7 @@ begin
     MessageDlg('Error: LS-005. Please contact the developer', mtError, [mbOK], 0);
   end;
 
-  // 旧版本显示磁盘空间
+  // Show disk space for older RPC versions
   if RpcObj.RPCVersion < 15 then
     if res.IndexOfName('download-dir-free-space') >= 0 then
       txDiskSpace.Caption:=txDiskSpace.Caption + ' ' + GetHumanSize(res.Floats['download-dir-free-space'])
@@ -1548,7 +1572,7 @@ begin
       txSize.Top:=(txSize.Top + txDiskSpace.Top) div 2;
     end;
 
-  // 下一步：torrent-add
+  // Next step: torrent-add
   StepTorrentAdd;
 end;
 
@@ -1569,12 +1593,12 @@ begin
     if i <> 0 then
       args.Add('peer-limit', TJSONIntegerNumber.Create(i));
 
-    // 处理空目录
+    // Handle empty directory
     try
       ss:=cbDestFolder.Text;
       if ss = '' then begin
         if cbDestFolder.Items.Count = 0 then
-          ss:='' // 后面会有 session-get 给默认值，但这里先空着
+          ss:='' // session-get will set the default later, leave empty for now
         else begin
           cbDestFolder.ItemIndex:=0;
           ss:=cbDestFolder.Text;
@@ -1617,7 +1641,7 @@ begin
   end;
   res:=TRpcUserRequest(ARequest).Result;
 
-  // 处理重复种子
+  // Handle duplicate torrent
   if res <> nil then begin
     if res.IndexOfName('torrent-duplicate') >= 0 then begin
       BeginAddTrackers(res.Objects['torrent-duplicate'].Integers['id']);
@@ -1641,15 +1665,15 @@ begin
     exit;
   end;
 
-  // 如果是"目录变更后重新添加"的分支（FOldDownloadDir 有值且已经过一轮 ShowModal），
-  // 直接跳转到 StepTorrentSet
+  // If this is the "re-add after directory change" branch (FOldDownloadDir set and already went through ShowModal),
+  // jump directly to StepTorrentSet
   if FOKClicked then begin
     MainForm.DoRefresh(True);
     StepTorrentSet;
     exit;
   end;
 
-  // 正常流程：刷新 + 获取文件信息
+  // Normal flow: refresh + get file info
   MainForm.DoRefresh(True);
   StepTorrentGetInfo;
 end;
@@ -1709,7 +1733,7 @@ begin
     exit;
   end;
 
-  // 填充 UI
+  // Populate UI
   FOldName:=UTF8Encode(t.Objects[0].Strings['name']);
   edSaveAs.Text:=FOldName;
   edSaveAs.Text:=ExcludeInvalidChar(edSaveAs.Text);
@@ -1737,7 +1761,7 @@ begin
 
   FOldDownloadDir:=cbDestFolder.Text;
 
-  // 全选文件 + 搜索扩展名 + 启动磁盘空间查询
+  // Select all files + search for good extension + start disk space query
   btSelectAllClick(nil);
   SearchGoodExtension;
   DiskSpaceTimerTimer(nil);
@@ -1745,18 +1769,18 @@ begin
   EnableControls(True);
   HideWaitMsg;
 
-  // 判断是否自动跳过对话框直接添加
+  // Decide whether to auto-skip the dialog and add directly
   ShowWindow:=Ini.ReadBool('Interface', 'ShowAddTorrentWindow', True);
   if MainForm.WatchDownloading then
     ShowWindow:=False;
   if not ShowWindow then begin
-    // 不显示对话框，直接走 OK 流程
+    // Don't show dialog, go directly through OK flow
     FOKClicked:=True;
     StepOKAfterModal;
   end;
 end;
 
-{ ---- OK 后的后半段流程 ---- }
+{ ---- Second half flow after OK ---- }
 
 procedure TAddTorrentForm.StepOKAfterModal;
 begin
@@ -1767,12 +1791,12 @@ begin
     ShowWaitMsg(Caption);
   EnableControls(False);
 
-  // 如果目录变了：先删旧的，再重新添加
-  // 两个请求在 RPC 队列中按顺序执行，不需要等 remove 回调
+  // If directory changed: remove old one first, then re-add
+  // Both requests execute sequentially in the RPC queue, no need to wait for remove callback
   if FOldDownloadDir <> cbDestFolder.Text then begin
     MainForm.QueueTorrentAction(FTorrentId, 'torrent-remove', nil, False);
     FTorrentId:=0;
-    StepTorrentAdd; // 重新添加，新目录
+    StepTorrentAdd; // re-add with new directory
     exit;
   end;
 
@@ -1841,7 +1865,7 @@ begin
     exit;
   end;
 
-  // 检查是否需要重命名
+  // Check if rename is needed
   edSaveAs.Text:=ExcludeInvalidChar(edSaveAs.Text);
   if FOldName <> edSaveAs.Text then begin
     StepTorrentRename;
@@ -1870,7 +1894,7 @@ begin
     request:=TRpcUserRequest.Create(req, False, -1, @TorrentRenameCompleted, FRequestLifetime);
     if not RpcObj.QueueUserRequest(request) then begin
       FRequestLifetime.Release;
-      // 重命名失败不终止，继续
+      // Rename failure doesn't stop the flow, continue
       StepTorrentStart;
       exit;
     end;
@@ -1887,7 +1911,7 @@ begin
     AsyncFinish(False);
     exit;
   end;
-  // 重命名失败不终止，继续
+  // Rename failure doesn't stop the flow, continue
   StepTorrentStart;
 end;
 
@@ -1897,7 +1921,7 @@ begin
   if cbStartTorrent.Checked then
     MainForm.QueueTorrentAction(FTorrentId, 'torrent-start', nil, True);
 
-  // post-add filter + 选中 torrent（用 PostAddTorrentId 机制异步选中）
+  // post-add filter + select torrent (async selection via PostAddTorrentId mechanism)
   if FPostAddFilterKind <> pafNone then begin
     MainForm.PostAddTorrentId:=FTorrentId;
     MainForm.PostAddFilterKind:=FPostAddFilterKind;
@@ -1908,25 +1932,25 @@ begin
   end;
   MainForm.DoRefresh(True);
 
-  // 清理文件 + 保存配置
+  // Clean up files + save settings
   if (Ini.ReadBool('Interface', 'DeleteTorrentFile', False) and not IsProtocolSupported(FFileName)) or MainForm.WatchDownloading then
     DeleteFileUTF8(FFileName);
 
   Ini.WriteInteger(FIniSec, 'PeerLimit', edPeerLimit.Value);
   MainForm.SaveDownloadDirs(cbDestFolder, 'LastDownloadDir');
 
-  // 完成
+  // Done
   AsyncFinish(True);
 end;
 
 procedure TAddTorrentForm.TorrentStartCompleted(ARequest: TObject);
 begin
-  // 预留：如果以后需要等启动完成再结束，可以在这里调用 AsyncFinish
-  // 目前不等启动完成，发完请求就结束
+  // Reserved: if we ever need to wait for start to complete before finishing, call AsyncFinish here
+  // Currently we don't wait for start completion, finish right after sending the request
 end;
 
 { ============================================================================
-  _AddTrackers 子流程（重复种子时合并 tracker）
+  _AddTrackers sub-flow (merge trackers for duplicate torrents)
   ============================================================================ }
 
 procedure TAddTorrentForm.BeginAddTrackers(TorrentId: integer);
@@ -1976,7 +2000,7 @@ begin
   try
     TorrentHash:='';
     if AnsiCompareText('magnet:?', Copy(FFileName, 1, 8)) = 0 then begin
-      // 从 magnet 链接解析 trackers
+      // Parse trackers from magnet link
       TrackersList.Delimiter:='&';
       TrackersList.DelimitedText:=Copy(FFileName, 9, MaxInt);
       i:=0;
@@ -2048,10 +2072,10 @@ begin
       end;
 
     FAddTrackersHash:=TorrentHash;
-    FAddTrackersList:=TrackersList; // 移交所有权
+    FAddTrackersList:=TrackersList; // transfer ownership
     TrackersList:=nil;
 
-    // 发 torrent-get 获取已有 trackers
+    // Send torrent-get to fetch existing trackers
     req:=TJSONObject.Create;
     try
       req.Add('method', 'torrent-get');
@@ -2113,14 +2137,14 @@ begin
     i:=tt.Integers['id'];
     if FAddTrackersTorrentId = 0 then begin
       FAddTrackersTorrentId:=i;
-      // 异步选中：设到 PostAddTorrentId，下次刷新时自动选中
+      // Async selection: set PostAddTorrentId, auto-selected on next refresh
       MainForm.PostAddTorrentId:=i;
       MainForm.PostAddFilterKind:=pafNone;
     end;
     FTorrentId:=i;
 
     trackers:=tt.Arrays['trackers'];
-    // 删除已存在的 trackers
+    // Remove already-existing trackers
     for i:=0 to trackers.Count - 1 do begin
       s:=UTF8Encode(trackers.Objects[i].Strings['announce']);
       j:=FAddTrackersList.IndexOf(s);
@@ -2129,13 +2153,13 @@ begin
     end;
 
     if FAddTrackersList.Count = 0 then begin
-      // 没有新 tracker 需要添加
+      // No new trackers to add
       MainForm.DoRefresh;
       AddTrackersFinish;
       exit;
     end;
 
-    // 发 torrent-set(trackerAdd)
+    // Send torrent-set(trackerAdd)
     addTrackers:=TJSONArray.Create;
     for i:=0 to FAddTrackersList.Count - 1 do
       addTrackers.Add(FAddTrackersList[i]);
@@ -2190,8 +2214,8 @@ begin
   if FAddTrackersList <> nil then
     FreeAndNil(FAddTrackersList);
   AppNormal;
-  FTorrentId:=0; // 重复种子，id 是已有的，不应该由 MainForm 清理
-  AsyncFinish(False); // 重复种子不算"成功添加"
+  FTorrentId:=0; // duplicate torrent, id already exists, should not be cleaned up by MainForm
+  AsyncFinish(False); // duplicate torrent doesn't count as "successful add"
 end;
 
 initialization

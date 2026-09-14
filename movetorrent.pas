@@ -162,8 +162,8 @@ begin
     exit;
   end;
 
-  // torrent-set-location 已提交成功，但 daemon 在后台移动数据。
-  // 开始轮询等待路径实际更新到位，对话框保持禁用状态。
+  // torrent-set-location submitted successfully, but daemon moves data in the background.
+  // Start polling for the path to actually update, keep dialog disabled while waiting.
   FTargetPath:=Trim(edTorrentDir.Text);
   FMoveStartTime:=Now;
   CheckMoveProgress;
@@ -177,7 +177,7 @@ var
   i: integer;
   request: TRpcUserRequest;
 begin
-  // 超时保护（20 秒）
+  // Timeout protection (20 seconds)
   if Now - FMoveStartTime >= 20 / SecsPerDay then begin
     EnableControls(True);
     ModalResult:=mrOK;
@@ -224,7 +224,7 @@ begin
   end;
   res:=TRpcUserRequest(ARequest).Result;
   if res = nil then begin
-    // 查询失败，不中断，等下次再查
+    // Query failed, don't abort, try again next time
     CheckMoveProgress;
     exit;
   end;
@@ -244,7 +244,7 @@ begin
     ModalResult:=mrOK;
   end
   else begin
-    // 还没完成，500ms 后再查（用定时器避免卡主线程）
+    // Not complete yet, check again in 500ms (timer avoids blocking the main thread)
     FPollTimer.Enabled:=True;
   end;
 end;

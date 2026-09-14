@@ -203,7 +203,7 @@ begin
     if not FRpc.FConnected then
       Terminate;
 
-    t:=Now - 1;  // 立即触发第一次刷新
+    t:=Now - 1;  // trigger first refresh immediately
     tt:=Now;
     while not Terminated do begin
       if Now - t >= RefreshInterval then begin
@@ -1230,19 +1230,20 @@ begin
   CancelPendingUserRequests;
   if Assigned(RpcThread) then begin
     RpcThread.Terminate;
-    // 关闭 socket，让正在阻塞的 HTTP 请求立即返回，加速线程退出
+    // Close the socket so any blocking HTTP request returns immediately, speeding up thread exit
     try
       Http.Sock.CloseSocket;
     except
     end;
-    // 不泵消息的等待：避免重入风险。
-    // 正常情况下 socket 关闭后 HTTP 很快失败，线程在几十毫秒内退出。
-    // 设 5 秒超时兜底，超时则放弃等待（线程仍在后台跑，但对象设为 nil 标志断开）。
+    // Wait without pumping messages: avoids re-entrancy risks.
+    // Normally HTTP fails quickly after socket close, thread exits in tens of milliseconds.
+    // 5-second timeout as fallback; on timeout we give up waiting (thread keeps running in background,
+    // but the object is set to nil to signal disconnection).
     tt:=Now;
     while Assigned(RpcThread) do begin
       Sleep(20);
       if Now - tt >= 5 / SecsPerDay then begin
-        // 超时：强制置空，避免主线程无限阻塞
+        // Timeout: force nil to prevent main thread from blocking indefinitely
         RpcThread:=nil;
         break;
       end;
