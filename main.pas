@@ -595,6 +595,7 @@ type
     procedure edSearchChange(Sender: TObject);
     procedure edSearchKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState );
     procedure FormActivate(Sender: TObject);
+    procedure FormDeactivate(Sender: TObject);
     procedure FormDropFiles(Sender: TObject; const FileNames: array of String);
     procedure FormKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure FormWindowStateChange(Sender: TObject);
@@ -647,6 +648,7 @@ type
     procedure VSplitterChangeBounds(Sender: TObject);
     function CorrectPath (path: string): string; // PETROV
   private
+    FDeactivateTime: TDateTime;  // last time the window lost focus (for tray click detection)
     FStarted: boolean;
     FTorrents: TVarList;
     FFiles: TVarList;
@@ -1867,6 +1869,7 @@ begin
   acTrackerGrouping.Checked:=Ini.ReadBool('Interface', 'TrackerGrouping', True);
   FLinksFromClipboard:=Ini.ReadBool('Interface', 'LinksFromClipboard', True);
   Application.OnActivate:=@FormActivate;
+  Application.OnDeactivate:=@FormDeactivate;
   Application.OnException:=@ApplicationPropertiesException;
 
   {$ifdef windows}
@@ -3467,6 +3470,11 @@ begin
   CheckClipboardLink;
 end;
 
+procedure TMainForm.FormDeactivate(Sender: TObject);
+begin
+  FDeactivateTime:=Now;
+end;
+
 procedure TMainForm.FormDropFiles(Sender: TObject; const FileNames: array of String);
 var
   i: integer;
@@ -4202,13 +4210,18 @@ begin
 end;
 
 procedure TMainForm.TrayIconDblClick(Sender: TObject);
+var
+  WasForeground: boolean;
 begin
 {$ifndef darwin}
-//  acShowApp.Execute;
-if (MainForm.Visible = false) or (MainForm.WindowState = wsMinimized) then
-    MainForm.ShowApp
-    else
-    MainForm.HideApp;
+  // was the window in the foreground before the tray click?
+  //   - active now, or
+  //   - just lost focus (within 500ms) — likely deactivated by the tray click itself
+  WasForeground := Active or ((Now - FDeactivateTime) < 500 / MSecsPerDay);
+  if (not Visible) or (WindowState = wsMinimized) or not WasForeground then
+    ShowApp
+  else
+    HideApp;
 {$endif darwin}
 end;
 
